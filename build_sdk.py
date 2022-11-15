@@ -44,8 +44,7 @@ class ConfigInfo:
     debug: bool
     kernel_options: KERNEL_CONFIG_TYPE
 
-
-SUPPORTED_BOARDS = (
+"""
     BoardInfo(
         name="tqma8xqp1gb",
         gcc_cpu="cortex-a35",
@@ -72,8 +71,21 @@ SUPPORTED_BOARDS = (
         examples = {
             "hello": Path("example/zcu102/hello")
         }
+    ),
+"""
+SUPPORTED_BOARDS = [
+    BoardInfo(
+    	name="qemu_arm_virt",
+    	gcc_cpu="cortex-a53",
+    	loader_link_address=0x70000000,
+    	kernel_options = {
+    	    "KernelPlatform": "qemu-arm-virt",
+            "KernelIsMCS": True,
+            "KernelArmExportPCNTUser": True,
+        },
+    	examples = {}
     )
-)
+]
 
 SUPPORTED_CONFIGS = (
     ConfigInfo(
