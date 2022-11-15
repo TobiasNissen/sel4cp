@@ -31,6 +31,9 @@ _Static_assert(sizeof(uintptr_t) == 8 || sizeof(uintptr_t) == 4, "Expect uintptr
 #if defined(BOARD_zcu102)
 #define GICD_BASE 0x00F9010000UL
 #define GICC_BASE 0x00F9020000UL
+#elif defined(BOARD_qemu_arm_virt)
+#define GICD_BASE 0x8010000UL
+#define GICC_BASE 0x8020000UL
 #endif
 
 #define REGION_TYPE_DATA 1
@@ -422,7 +425,7 @@ start_kernel(void)
     );
 }
 
-#if defined(BOARD_zcu102)
+#if defined(BOARD_zcu102) || defined(BOARD_qemu_arm_virt)
 static void
 configure_gicv2(void)
 {
@@ -488,7 +491,7 @@ main(void)
      */
     copy_data();
 
-#if defined(BOARD_zcu102)
+#if defined(BOARD_zcu102) || defined(BOARD_qemu_arm_virt)
     configure_gicv2();
 #endif
 
