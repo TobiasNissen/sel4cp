@@ -650,7 +650,7 @@ def build_system(
     ## Get the elf files for each pd:
     pd_elf_files = {
         pd: ElfFile.from_path(_get_full_path(pd.program_image, search_paths))
-        for pd in system.protection_domains
+        for pd in system.protection_domains if pd.program_image is not None # There are no ELF files for empty PDs.
     }
     ### Here we should validate that ELF files
 
@@ -693,6 +693,11 @@ def build_system(
     # Now we create additional MRs (and mappings) for the ELF files.
     pd_elf_regions = {}
     for pd in system.protection_domains:
+        # No memory regions should be created for the non-specified ELF file 
+        # of an empty PD.
+        if pd.program_image is None:
+            continue 
+            
         elf_regions: List[Tuple[int, bytearray, str]] = []
         seg_idx = 0
         for segment in pd_elf_files[pd].segments:
@@ -984,6 +989,11 @@ def build_system(
     extra_mrs = []
     pd_extra_maps: Dict[ProtectionDomain, Tuple[SysMap, ...]] = {pd: tuple() for pd in system.protection_domains}
     for pd in system.protection_domains:
+        # No memory regions should be created for the non-specified ELF file 
+        # of an empty PD.
+        if pd.program_image is None:
+            continue  
+            
         seg_idx = 0
         for segment in pd_elf_files[pd].segments:
             if not segment.loadable:
@@ -1110,7 +1120,11 @@ def build_system(
     ds = []
     pts = []
     for pd_idx, pd in enumerate(system.protection_domains):
-        ipc_buffer_vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
+        if pd.program_image is None:
+            ipc_buffer_vaddr = 0x1000
+        else:
+            ipc_buffer_vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
+            
         upper_directory_vaddrs = set()
         directory_vaddrs = set()
         page_table_vaddrs = set()
@@ -1452,7 +1466,10 @@ def build_system(
 
     # And, finally, map all the IPC buffers
     for vspace_obj, pd, ipc_buffer_obj in zip(vspace_objects, system.protection_domains, ipc_buffer_objects):
-        vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
+        if pd.program_image is None:
+            vaddr = 0
+        else:
+            vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
         system_invocations.append(
             Sel4PageMap(
                 ipc_buffer_obj.cap_addr,
@@ -1490,28 +1507,37 @@ def build_system(
 
     # set IPC buffer
     for tcb_obj, pd, ipc_buffer_obj in zip(tcb_objects, system.protection_domains, ipc_buffer_objects):
-        ipc_buffer_vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
+        if pd.program_image is None:
+            ipc_buffer_vaddr = 0x1000
+        else:
+            ipc_buffer_vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
         system_invocations.append(Sel4TcbSetIpcBuffer(tcb_obj.cap_addr, ipc_buffer_vaddr, ipc_buffer_obj.cap_addr,))
 
     # set register (entry point)
     for tcb_obj, pd in zip(tcb_objects, system.protection_domains):
-        system_invocations.append(
-            Sel4TcbWriteRegisters(
-                tcb_obj.cap_addr,
-                False,
-                0, # no flags on ARM
-                Sel4Aarch64Regs(pc=pd_elf_files[pd].entry)
+        # Only set the entry point for non-empty PDs.
+        if pd.program_image is not None:
+            system_invocations.append(
+                Sel4TcbWriteRegisters(
+                    tcb_obj.cap_addr,
+                    False,
+                    0, # no flags on ARM
+                    Sel4Aarch64Regs(pc=pd_elf_files[pd].entry)
+                )
             )
-        )
     # bind the notification object
     invocation = Sel4TcbBindNotification(tcb_objects[0].cap_addr, notification_objects[0].cap_addr)
     invocation.repeat(count=len(system.protection_domains), tcb=1, notification=1)
     system_invocations.append(invocation)
 
-    # Resume (start) all the threads
-    invocation = Sel4TcbResume(tcb_objects[0].cap_addr)
-    invocation.repeat(count=len(system.protection_domains), tcb=1)
-    system_invocations.append(invocation)
+    # Resume (start) all the threads, except for empty PDs.
+    for tcb_object, pd in zip(tcb_objects, system.protection_domains):
+        if pd.program_image is not None:
+            system_invocations.append(Sel4TcbResume(tcb_object.cap_addr))
+    # TODO: Delete this.
+    #invocation = Sel4TcbResume(tcb_objects[0].cap_addr)
+    #invocation.repeat(count=len(system.protection_domains), tcb=1)
+    #system_invocations.append(invocation)
 
     # All of the objects are created at this point; we don't need to both
     # the allocators from here.
@@ -1524,10 +1550,15 @@ def build_system(
 
 
     for pd in system.protection_domains:
-        # Could use pd.elf_file.write_symbol here to update variables if required.
-        pd_elf_files[pd].write_symbol("sel4cp_name", pack("<16s", pd.name.encode("utf8")))
+        # We can only write the 'sel4cp_name' symbol if the PD is non-empty.
+        if pd.program_image is not None:
+            # Could use pd.elf_file.write_symbol here to update variables if required.
+            pd_elf_files[pd].write_symbol("sel4cp_name", pack("<16s", pd.name.encode("utf8")))
 
     for pd in system.protection_domains:
+        # We can only set variables for non-empty PDs.
+        if pd.program_image is None:
+            continue
         for setvar in pd.setvars:
             if setvar.region_paddr is not None:
                 for mr in system.memory_regions:

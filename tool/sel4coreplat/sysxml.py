@@ -318,9 +318,6 @@ def xml2pd(pd_xml: ET.Element, is_child: bool=False) -> ProtectionDomain:
         except ValueError as e:
             raise UserError(f"Error: {e} on element '{child.tag}': {child._loc_str}")  # type: ignore
 
-    if program_image is None:
-        raise ValueError("program_image must be specified")
-
     return ProtectionDomain(
         pd_id,
         name,
