@@ -1467,7 +1467,7 @@ def build_system(
     # And, finally, map all the IPC buffers
     for vspace_obj, pd, ipc_buffer_obj in zip(vspace_objects, system.protection_domains, ipc_buffer_objects):
         if pd.program_image is None:
-            vaddr = 0
+            vaddr = 0x1000
         else:
             vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
         system_invocations.append(
