@@ -140,7 +140,6 @@ putc(uint8_t ch)
 #define PL011_UARTFR_TXFF (1 << 5)
 #define UARTDR 0x000
 #define UARTFR 0x018
-// #define UARTIMSC 0x038
 
 static void
 putc(uint8_t ch)

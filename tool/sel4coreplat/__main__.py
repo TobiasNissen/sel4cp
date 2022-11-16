@@ -1534,10 +1534,6 @@ def build_system(
     for tcb_object, pd in zip(tcb_objects, system.protection_domains):
         if pd.program_image is not None:
             system_invocations.append(Sel4TcbResume(tcb_object.cap_addr))
-    # TODO: Delete this.
-    #invocation = Sel4TcbResume(tcb_objects[0].cap_addr)
-    #invocation.repeat(count=len(system.protection_domains), tcb=1)
-    #system_invocations.append(invocation)
 
     # All of the objects are created at this point; we don't need to both
     # the allocators from here.
@@ -1556,9 +1552,6 @@ def build_system(
             pd_elf_files[pd].write_symbol("sel4cp_name", pack("<16s", pd.name.encode("utf8")))
 
     for pd in system.protection_domains:
-        # We can only set variables for non-empty PDs.
-        if pd.program_image is None:
-            continue
         for setvar in pd.setvars:
             if setvar.region_paddr is not None:
                 for mr in system.memory_regions:

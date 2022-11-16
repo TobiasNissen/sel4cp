@@ -278,6 +278,8 @@ def xml2pd(pd_xml: ET.Element, is_child: bool=False) -> ProtectionDomain:
         raise ValueError(f"budget ({budget}) must be less than, or equal to, period ({period})")
 
     pp = str_to_bool(pd_xml.attrib.get("pp", "false"))
+    
+    is_empty_pd = "program_image" not in [child.tag for child in pd_xml]
 
     maps = []
     irqs = []
@@ -300,6 +302,8 @@ def xml2pd(pd_xml: ET.Element, is_child: bool=False) -> ProtectionDomain:
 
                 setvar_vaddr = child.attrib.get("setvar_vaddr")
                 if setvar_vaddr:
+                    if is_empty_pd:
+                        raise UserError(f"The protection domain '{name}' is empty but contains at least one 'map' element with a 'setvar_vaddr' attribute. Empty protection domains can not contain such 'map' elements.")
                     setvars.append(SysSetVar(setvar_vaddr, vaddr=vaddr))
             elif child.tag == "irq":
                 _check_attrs(child, ("irq", "id"))
@@ -307,6 +311,8 @@ def xml2pd(pd_xml: ET.Element, is_child: bool=False) -> ProtectionDomain:
                 id_ = int(checked_lookup(child, "id"), base=0)
                 irqs.append(SysIrq(irq, id_))
             elif child.tag == "setvar":
+                if is_empty_pd:
+                    raise UserError(f"The protection domain '{name}' is empty but contains at least one 'setvar' element. Empty protection domains can not contain 'setvar' elements.")
                 _check_attrs(child, ("symbol", "region_paddr"))
                 symbol = checked_lookup(child, "symbol")
                 region_paddr = checked_lookup(child, "region_paddr")
