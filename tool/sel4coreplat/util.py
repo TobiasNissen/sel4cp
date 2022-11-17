@@ -37,7 +37,8 @@ def round_down(n: int, x: int) -> int:
 
 def mask_bits(n: int, bits: int) -> int:
     """mask out (set to zero) the lower bits from n"""
-    assert n > 0
+    if n == 0:
+        return n;
     return (n >> bits) << bits
 
 

@@ -122,6 +122,8 @@ default_platform_description = PlatformDescription(
     page_sizes = (0x1_000, 0x200_000)
 )
 
+EMPTY_PD_IPC_BUFFER_VADDR = 0x203000
+
 @dataclass
 class MonitorConfig:
     untyped_info_symbol_name: str
@@ -989,8 +991,8 @@ def build_system(
     extra_mrs = []
     pd_extra_maps: Dict[ProtectionDomain, Tuple[SysMap, ...]] = {pd: tuple() for pd in system.protection_domains}
     for pd in system.protection_domains:
-        # No memory regions should be created for the non-specified ELF file 
-        # of an empty PD.
+        # No memory regions should be created for the ELF file 
+        # of an empty PD since no such ELF file has been declared.
         if pd.program_image is None:
             continue  
             
@@ -1121,7 +1123,7 @@ def build_system(
     pts = []
     for pd_idx, pd in enumerate(system.protection_domains):
         if pd.program_image is None:
-            ipc_buffer_vaddr = 0x1000
+            ipc_buffer_vaddr = EMPTY_PD_IPC_BUFFER_VADDR
         else:
             ipc_buffer_vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
             
@@ -1129,9 +1131,9 @@ def build_system(
         directory_vaddrs = set()
         page_table_vaddrs = set()
 
-        # For each page, in each map determine we determine
-        # which upper directory, directory and page table is resides
-        # in, and then page sure this is set
+        # For each page, in each map we determine
+        # which upper directory, directory and page table it resides
+        # in, and then make sure this is set
         vaddrs = [(ipc_buffer_vaddr, 0x1000)]
         for map in (pd.maps + pd_extra_maps[pd]):
             mr = all_mr_by_name[map.mr]
@@ -1467,7 +1469,7 @@ def build_system(
     # And, finally, map all the IPC buffers
     for vspace_obj, pd, ipc_buffer_obj in zip(vspace_objects, system.protection_domains, ipc_buffer_objects):
         if pd.program_image is None:
-            vaddr = 0x1000
+            vaddr = EMPTY_PD_IPC_BUFFER_VADDR
         else:
             vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
         system_invocations.append(
@@ -1508,7 +1510,7 @@ def build_system(
     # set IPC buffer
     for tcb_obj, pd, ipc_buffer_obj in zip(tcb_objects, system.protection_domains, ipc_buffer_objects):
         if pd.program_image is None:
-            ipc_buffer_vaddr = 0x1000
+            ipc_buffer_vaddr = EMPTY_PD_IPC_BUFFER_VADDR
         else:
             ipc_buffer_vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
         system_invocations.append(Sel4TcbSetIpcBuffer(tcb_obj.cap_addr, ipc_buffer_vaddr, ipc_buffer_obj.cap_addr,))
