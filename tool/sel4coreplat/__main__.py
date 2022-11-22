@@ -151,11 +151,11 @@ MONITOR_CONFIG = MonitorConfig(
     system_invocation_count_symbol_name = "system_invocation_count",
 )
 
-# Will be either the notification or endpoint cap
-INPUT_CAP_IDX = 1
+INPUT_CAP_IDX = 1 # Will be either the notification or endpoint cap
 FAULT_EP_CAP_IDX = 2
 VSPACE_CAP_IDX = 3
 REPLY_CAP_IDX = 4
+TCB_CAP_IDX = 5 # the index of the capability to the PD's own TCB.
 BASE_OUTPUT_NOTIFICATION_CAP = 10
 BASE_OUTPUT_ENDPOINT_CAP = BASE_OUTPUT_NOTIFICATION_CAP + 64
 BASE_IRQ_CAP = BASE_OUTPUT_ENDPOINT_CAP + 64
@@ -1165,7 +1165,7 @@ def build_system(
     pt_names = [f"PageTable: PD={pd_names[pd_idx]} VADDR=0x{vaddr:x}" for pd_idx, vaddr in pts]
     pt_objects = init_system.allocate_objects(SEL4_PAGE_TABLE_OBJECT, pt_names)
 
-    # Create CNodes - all CNode objects are the same size: 128 slots.
+    # Create CNodes - all CNode objects are the same size: 256 slots.
     cnode_names = [f"CNode: PD={pd.name}" for pd in system.protection_domains]
     cnode_objects = init_system.allocate_objects(SEL4_CNODE_OBJECT, cnode_names, size=PD_CAP_SIZE)
     cnode_objects_by_pd = dict(zip(system.protection_domains, cnode_objects))
@@ -1193,8 +1193,6 @@ def build_system(
             irq_cap_addresses[pd].append(cap_address)
 
     # This has to be done prior to minting!
-    # for vspace_obj in vspace_objects:
-    #     system_invocations.append(Sel4AsidPoolAssign(INIT_ASID_POOL_CAP_ADDRESS, vspace_obj.cap_addr))
     invocation = Sel4AsidPoolAssign(INIT_ASID_POOL_CAP_ADDRESS, vspace_objects[0].cap_addr)
     invocation.repeat(len(system.protection_domains), vspace=1)
     system_invocations.append(invocation)
@@ -1336,6 +1334,7 @@ def build_system(
             )
 
     ## Mint access to the child TCB in the PD Cspace
+    ## Furthermore, give each PD access to its own protection domain.
     for cnode_obj, pd in zip(cnode_objects, system.protection_domains):
         for maybe_child_tcb, maybe_child_pd in zip(tcb_objects, system.protection_domains):
             if maybe_child_pd.parent is pd:
@@ -1351,6 +1350,20 @@ def build_system(
                         SEL4_RIGHTS_ALL,
                         0)
                 )
+            # Give the PD access to its own TCB.
+            elif maybe_child_pd is pd:
+                system_invocations.append(
+                    Sel4CnodeMint(
+                        cnode_obj.cap_addr,
+                        TCB_CAP_IDX,
+                        PD_CAP_BITS,
+                        root_cnode_cap,
+                        maybe_child_tcb.cap_addr,
+                        kernel_config.cap_address_bits,
+                        SEL4_RIGHTS_ALL,
+                        0)
+                )
+                
 
     for cc in system.channels:
         pd_a = system.pd_by_name[cc.pd_a]
@@ -1362,7 +1375,7 @@ def build_system(
         pd_a_endpoint_obj = pd_endpoint_objects.get(pd_a)
         pd_b_endpoint_obj = pd_endpoint_objects.get(pd_b)
 
-        # Set up the notification baps
+        # Set up the notification caps
         pd_a_cap_idx = BASE_OUTPUT_NOTIFICATION_CAP + cc.id_a
         pd_a_badge = 1 << cc.id_b
         #pd_a.cnode.mint(pd_a_cap_idx, PD_CAPTABLE_BITS, sel4.init_cnode, pd_b.notification, 64, SEL4_RIGHTS_ALL, pd_a_badge)
