@@ -156,13 +156,16 @@ FAULT_EP_CAP_IDX = 2
 VSPACE_CAP_IDX = 3
 REPLY_CAP_IDX = 4
 TCB_CAP_IDX = 5 # the index of the capability to the PD's own TCB.
+SCHED_CONTROL_CAP_IDX = 6
 BASE_OUTPUT_NOTIFICATION_CAP = 10
 BASE_OUTPUT_ENDPOINT_CAP = BASE_OUTPUT_NOTIFICATION_CAP + 64
 BASE_IRQ_CAP = BASE_OUTPUT_ENDPOINT_CAP + 64
 BASE_TCB_CAP = BASE_IRQ_CAP + 64
+BASE_SCHED_CONTEXT_CAP = BASE_TCB_CAP + 256
+
 MAX_SYSTEM_INVOCATION_SIZE = mb(128)
 PD_CAPTABLE_BITS = 12
-PD_CAP_SIZE = 256
+PD_CAP_SIZE = 1024
 PD_CAP_BITS = int(log2(PD_CAP_SIZE))
 PD_SCHEDCONTEXT_SIZE = (1 << 8)
 
@@ -1165,7 +1168,7 @@ def build_system(
     pt_names = [f"PageTable: PD={pd_names[pd_idx]} VADDR=0x{vaddr:x}" for pd_idx, vaddr in pts]
     pt_objects = init_system.allocate_objects(SEL4_PAGE_TABLE_OBJECT, pt_names)
 
-    # Create CNodes - all CNode objects are the same size: 256 slots.
+    # Create CNodes - all CNode objects are the same size: PD_CAP_SIZE slots.
     cnode_names = [f"CNode: PD={pd.name}" for pd in system.protection_domains]
     cnode_objects = init_system.allocate_objects(SEL4_CNODE_OBJECT, cnode_names, size=PD_CAP_SIZE)
     cnode_objects_by_pd = dict(zip(system.protection_domains, cnode_objects))
@@ -1198,6 +1201,19 @@ def build_system(
     system_invocations.append(invocation)
 
     # Create copies of all caps required via minting.
+    
+    # Mint access to the SchedControl cap for all PDs.
+    for cnode_obj in cnode_objects:
+        system_invocations.append(Sel4CnodeMint(
+            cnode_obj.cap_addr, 
+            SCHED_CONTROL_CAP_IDX, 
+            PD_CAP_BITS, 
+            INIT_CNODE_CAP_ADDRESS, 
+            kernel_boot_info.schedcontrol_cap, 
+            kernel_config.cap_address_bits, 
+            SEL4_RIGHTS_ALL, 
+            0)
+        )
 
     # Mint copies of required pages, while also determing what's required
     # for later mapping
@@ -1333,19 +1349,31 @@ def build_system(
                     0)
             )
 
-    ## Mint access to the child TCB in the PD Cspace
+    ## Mint access to the child TCB and the child SchedContext in the PD Cspace
     ## Furthermore, give each PD access to its own protection domain.
     for cnode_obj, pd in zip(cnode_objects, system.protection_domains):
-        for maybe_child_tcb, maybe_child_pd in zip(tcb_objects, system.protection_domains):
+        for maybe_child_tcb, maybe_child_schedcontext_obj, maybe_child_pd in zip(tcb_objects, schedcontext_objects, system.protection_domains):
             if maybe_child_pd.parent is pd:
-                cap_idx = BASE_TCB_CAP + maybe_child_pd.pd_id
+                tcb_cap_idx = BASE_TCB_CAP + maybe_child_pd.pd_id
+                schedcontext_idx = BASE_SCHED_CONTEXT_CAP + maybe_child_pd.pd_id
                 system_invocations.append(
                     Sel4CnodeMint(
                         cnode_obj.cap_addr,
-                        cap_idx,
+                        tcb_cap_idx,
                         PD_CAP_BITS,
                         root_cnode_cap,
                         maybe_child_tcb.cap_addr,
+                        kernel_config.cap_address_bits,
+                        SEL4_RIGHTS_ALL,
+                        0)
+                )
+                system_invocations.append(
+                    Sel4CnodeMint(
+                        cnode_obj.cap_addr,
+                        schedcontext_idx,
+                        PD_CAP_BITS,
+                        root_cnode_cap,
+                        maybe_child_schedcontext_obj.cap_addr,
                         kernel_config.cap_address_bits,
                         SEL4_RIGHTS_ALL,
                         0)
