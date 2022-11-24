@@ -81,7 +81,7 @@ class SysSetVar:
 
 @dataclass(frozen=True, eq=True)
 class ProtectionDomain:
-    pd_id: Optional[int]
+    pd_id: Optional[int] # Guaranteed to have a value when part of a SystemDescription.
     name: str
     priority: int
     budget: int
@@ -120,13 +120,6 @@ class Channel:
 
 
 def _pd_tree_to_list(root_pd: ProtectionDomain, parent_pd: Optional[ProtectionDomain]) -> Tuple[ProtectionDomain, ...]:
-    # Check child PDs have unique identifiers
-    child_ids = set()
-    for child_pd in root_pd.child_pds:
-        if child_pd.pd_id in child_ids:
-            raise UserError(f"duplicate pd_id: {child_pd.pd_id} in protection domain: '{root_pd.name}' @ {child_pd.element._loc_str}")  # type: ignore
-        child_ids.add(child_pd.pd_id)
-
     new_root_pd = replace(root_pd, child_pds=tuple(), parent=parent_pd)
     new_child_pds = sum((_pd_tree_to_list(child_pd, new_root_pd) for child_pd in root_pd.child_pds), tuple())
     return (new_root_pd, ) + new_child_pds
@@ -175,6 +168,13 @@ class SystemDescription:
             if mr.name in self.mr_by_name:
                 raise UserError(f"Duplicate memory region name '{mr.name}'.")
             self.mr_by_name[mr.name] = mr
+            
+        # Ensure no duplicate PD ids.
+        pd_ids = set()
+        for pd in self.protection_domains:
+            if pd.pd_id in pd_ids:
+                raise UserError(f"Duplicate pd_id: {pd.pd_id} @ {pd.element._loc_str}")
+            pd_ids.add(pd.pd_id)
 
         # Ensure all CCs make senses
         for cc in self.channels:
@@ -254,26 +254,30 @@ def xml2mr(mr_xml: ET.Element, plat_desc: PlatformDescription) -> SysMemoryRegio
     return SysMemoryRegion(name, size, page_size, page_count, paddr)
 
 
-def xml2pd(pd_xml: ET.Element, is_child: bool=False) -> ProtectionDomain:
-    root_attrs = ("name", "priority", "pp", "budget", "period")
-    child_attrs = root_attrs + ("pd_id", )
-    _check_attrs(pd_xml, child_attrs if is_child else root_attrs)
+def xml2pd(pd_xml: ET.Element, unused_pd_ids: Set[int], is_child: bool=False) -> ProtectionDomain:
+    root_attrs = ("name", "pd_id", "priority", "pp", "budget", "period")
+    _check_attrs(pd_xml, root_attrs)
     program_image: Optional[Path] = None
     name = checked_lookup(pd_xml, "name")
     priority = int(pd_xml.attrib.get("priority", "0"), base=0)
     if priority < 0 or priority > 254:
         raise ValueError("priority must be between 0 and 254")
+    
+    pd_id = pd_xml.attrib.get("pd_id", None)
+    if pd_id is None:
+        if len(unused_pd_ids) == 0:
+            raise UserError(f"Too many protection domains defined. Maximum is 63.")
+        pd_id = unused_pd_ids.pop()
+    else:
+        pd_id = int(pd_id, base=0)
+        if pd_id not in unused_pd_ids:
+            raise UserError(f"Duplicate pd_id: {pd.pd_id} @ {pd_xml._loc_str}")
+        unused_pd_ids.remove(pd_id)
+    if pd_id < 0 or pd_id >= 63:
+        raise ValueError("pd_id must be between 0 and 62")
 
     budget = int(pd_xml.attrib.get("budget", "1000"), base=0)
     period = int(pd_xml.attrib.get("period", str(budget)), base=0)
-    pd_id = None
-    if is_child:
-        pd_id = int(checked_lookup(pd_xml, "pd_id"), base=0)
-        if pd_id < 0 or pd_id > 255:
-            raise ValueError("pd_id must be between 0 and 255")
-    else:
-        pd_id = None
-
     if budget > period:
         raise ValueError(f"budget ({budget}) must be less than, or equal to, period ({period})")
 
@@ -318,7 +322,7 @@ def xml2pd(pd_xml: ET.Element, is_child: bool=False) -> ProtectionDomain:
                 region_paddr = checked_lookup(child, "region_paddr")
                 setvars.append(SysSetVar(symbol, region_paddr=region_paddr))
             elif child.tag == "protection_domain":
-                child_pds.append(xml2pd(child, is_child=True))
+                child_pds.append(xml2pd(child, unused_pd_ids, is_child=True))
             else:
                 raise UserError(f"Invalid XML element '{child.tag}': {child._loc_str}")  # type: ignore
         except ValueError as e:
@@ -388,16 +392,17 @@ def xml2system(filename: Path, plat_desc: PlatformDescription) -> SystemDescript
     memory_regions = []
     protection_domains = []
     channels = []
+    unused_pd_ids = set(range(63))
 
     # Ensure there is no non-whitespace text
     _check_no_text(root)
-
+    
     for child in root:
         try:
             if child.tag == "memory_region":
                 memory_regions.append(xml2mr(child, plat_desc))
             elif child.tag == "protection_domain":
-                protection_domains.append(xml2pd(child))
+                protection_domains.append(xml2pd(child, unused_pd_ids))
             elif child.tag == "channel":
                 channels.append(xml2channel(child))
             else:

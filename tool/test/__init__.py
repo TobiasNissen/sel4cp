@@ -143,4 +143,4 @@ class SystemParseTests(ExtendedTestCase):
         self._check_error("sys_map_not_aligned.xml", "Invalid vaddr alignment on 'map' @ ")
 
     def test_too_many_pds(self):
-        self._check_error("sys_too_many_pds.xml", "Too many protection domains (64) defined. Maximum is 63.")
+        self._check_error("sys_too_many_pds.xml", "Too many protection domains defined. Maximum is 63.")

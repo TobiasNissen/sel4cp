@@ -163,6 +163,7 @@ BASE_IRQ_CAP = BASE_OUTPUT_ENDPOINT_CAP + 64
 BASE_TCB_CAP = BASE_IRQ_CAP + 64
 BASE_SCHED_CONTEXT_CAP = BASE_TCB_CAP + 64
 BASE_UNBADGED_CHANNEL_CAP = BASE_SCHED_CONTEXT_CAP + 64
+BASE_CNODE_CAP = BASE_UNBADGED_CHANNEL_CAP + 64
 
 MAX_SYSTEM_INVOCATION_SIZE = mb(128)
 PD_CAPTABLE_BITS = 12
@@ -1306,10 +1307,10 @@ def build_system(
 
     final_cap_slot = cap_slot
 
-    ## Minting in the address space
+    # Mint access for each PD to its own channel object (notification or endpoint).
+    assert INPUT_CAP_IDX < PD_CAP_SIZE
     for pd, notification_obj, cnode_obj in zip(system.protection_domains, notification_objects, cnode_objects):
         obj = pd_endpoint_objects[pd] if pd.needs_ep else notification_obj
-        assert INPUT_CAP_IDX < PD_CAP_SIZE
         system_invocations.append(
             Sel4CnodeMint(
                 cnode_obj.cap_addr,
@@ -1321,6 +1322,70 @@ def build_system(
                 SEL4_RIGHTS_ALL,
                 0)
         )
+    
+    # Setup the BASE_UNBADGED_CHANNEL_CAP and BASE_CNODE_CAP areas.
+    for pd, cnode_obj in zip(system.protection_domains, cnode_objects):
+        # Add the PDs own channel capability to the BASE_UNBADGED_CHANNEL_CAP area.
+        system_invocations.append(
+            Sel4CnodeMint(
+                cnode_obj.cap_addr,
+                BASE_UNBADGED_CHANNEL_CAP + pd.pd_id,
+                PD_CAP_BITS,
+                cnode_obj.cap_addr,
+                INPUT_CAP_IDX,
+                PD_CAP_BITS,
+                SEL4_RIGHTS_ALL,
+                0
+            )
+        )
+        # Add the PDs own CNode capability to the BASE_CNODE_CAP area.
+        system_invocations.append(
+            Sel4CnodeMint(
+                cnode_obj.cap_addr,
+                BASE_CNODE_CAP + pd.pd_id,
+                PD_CAP_BITS,
+                root_cnode_cap,
+                cnode_obj.cap_addr,
+                kernel_config.cap_address_bits,
+                SEL4_RIGHTS_ALL,
+                0
+            )
+        )
+        
+        # Ensure that a parent PD always has an unbadged capability to all its children's
+        # channel objects (notifications or endpoints).
+        # The same is the case for the BASE_CNODE_CAP area.
+        for maybe_child_pd, maybe_child_cnode_obj in zip(system.protection_domains, cnode_objects):
+            if maybe_child_pd.parent is not pd:
+                continue
+            system_invocations.append(
+                Sel4CnodeMint(
+                    cnode_obj.cap_addr,
+                    BASE_UNBADGED_CHANNEL_CAP + maybe_child_pd.pd_id,
+                    PD_CAP_BITS,
+                    maybe_child_cnode_obj.cap_addr,
+                    INPUT_CAP_IDX,
+                    PD_CAP_BITS,
+                    SEL4_RIGHTS_ALL,
+                    0
+                )
+            )
+            # Add the PDs own CNode capability to the BASE_CNODE_CAP area.
+            system_invocations.append(
+                Sel4CnodeMint(
+                    cnode_obj.cap_addr,
+                    BASE_CNODE_CAP + maybe_child_pd.pd_id,
+                    PD_CAP_BITS,
+                    root_cnode_cap,
+                    maybe_child_cnode_obj.cap_addr,
+                    kernel_config.cap_address_bits,
+                    SEL4_RIGHTS_ALL,
+                    0
+                )
+            )
+       # TODO: Do the setup for non-child PDs which have explicitly been marked
+       # as being managed by the current PD.
+    
 
     assert REPLY_CAP_IDX < PD_CAP_SIZE
     invocation = Sel4CnodeMint(cnode_objects[0].cap_addr, REPLY_CAP_IDX, PD_CAP_BITS, root_cnode_cap, pd_reply_objects[0].cap_addr, kernel_config.cap_address_bits, SEL4_RIGHTS_ALL, 1)
