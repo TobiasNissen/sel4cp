@@ -64,6 +64,7 @@ from sel4coreplat.sel4 import (
     Sel4TcbBindNotification,
     Sel4TcbResume,
     Sel4CnodeMint,
+    Sel4CnodeMove,
     Sel4UntypedRetype,
     Sel4IrqControlGet,
     Sel4IrqHandlerSetNotification,
@@ -151,6 +152,12 @@ MONITOR_CONFIG = MonitorConfig(
     system_invocation_count_symbol_name = "system_invocation_count",
 )
 
+# TODO: Get the following values from the system configuration instead of hardcoding them here.
+POOL_NUM_PAGE_UPPER_DIRECTORIES = 5
+POOL_NUM_PAGE_DIRECTORIES = 5
+POOL_NUM_PAGE_TABLES = 10
+POOL_NUM_PAGES = 100
+
 INPUT_CAP_IDX = 1 # Will be either the notification or endpoint cap
 FAULT_EP_CAP_IDX = 2
 VSPACE_CAP_IDX = 3
@@ -164,10 +171,12 @@ BASE_TCB_CAP = BASE_IRQ_CAP + 64
 BASE_SCHED_CONTEXT_CAP = BASE_TCB_CAP + 64
 BASE_UNBADGED_CHANNEL_CAP = BASE_SCHED_CONTEXT_CAP + 64
 BASE_CNODE_CAP = BASE_UNBADGED_CHANNEL_CAP + 64
+BASE_VSPACE_CAP = BASE_CNODE_CAP + 64
+BASE_PAGING_STRUCTURE_POOL = BASE_VSPACE_CAP + 64
+BASE_SHARED_MEMORY_REGION_PAGES = BASE_PAGING_STRUCTURE_POOL + POOL_NUM_PAGE_UPPER_DIRECTORIES + POOL_NUM_PAGE_DIRECTORIES + POOL_NUM_PAGE_TABLES + POOL_NUM_PAGES
 
 MAX_SYSTEM_INVOCATION_SIZE = mb(128)
-PD_CAPTABLE_BITS = 12
-PD_CAP_SIZE = 1024
+PD_CAP_SIZE = 2048
 PD_CAP_BITS = int(log2(PD_CAP_SIZE))
 PD_SCHEDCONTEXT_SIZE = (1 << 8)
 
@@ -1047,7 +1056,7 @@ def build_system(
         if mr.phys_addr is not None:
             continue
         page_size_human = human_size_strict(mr.page_size)
-        page_names_by_size[mr.page_size] +=  [f"Page({page_size_human}): MR={mr.name} #{idx}" for idx in range(mr.page_count)]
+        page_names_by_size[mr.page_size] += [f"Page({page_size_human}): MR={mr.name} #{idx}" for idx in range(mr.page_count)]
 
     page_objects: Dict[int, List[KernelObject]] = {}
 
@@ -1091,6 +1100,7 @@ def build_system(
         name = f"{obj_type_name}: MR={mr.name} @ {phys_addr:x}"
         page = init_system.allocate_fixed_objects(phys_addr, obj_type, 1, names=[name])[0]
         mr_pages[mr].append(page)
+        
 
     tcb_names = [f"TCB: PD={pd.name}" for pd in system.protection_domains]
     tcb_objects = init_system.allocate_objects(SEL4_TCB_OBJECT, tcb_names)
@@ -1174,9 +1184,113 @@ def build_system(
     cnode_names = [f"CNode: PD={pd.name}" for pd in system.protection_domains]
     cnode_objects = init_system.allocate_objects(SEL4_CNODE_OBJECT, cnode_names, size=PD_CAP_SIZE)
     cnode_objects_by_pd = dict(zip(system.protection_domains, cnode_objects))
+    
+    # This has to be done prior to minting!
+    invocation = Sel4AsidPoolAssign(INIT_ASID_POOL_CAP_ADDRESS, vspace_objects[0].cap_addr)
+    invocation.repeat(len(system.protection_domains), vspace=1)
+    system_invocations.append(invocation)
+    
+    
+    # Allocate the pool of unused paging structures for each PD.
+    # Furthermore, ensure that each PD can access the pool by minting capabilities into its CSpace.
+    for pd, cnode_obj in zip(system.protection_domains, cnode_objects):
+        pool_objects = []
+        
+        pud_pool_names = [f"PageUpperDirectory: PD={pd.name} POOL" for _ in range(POOL_NUM_PAGE_UPPER_DIRECTORIES)]
+        pool_objects += init_system.allocate_objects(SEL4_PAGE_UPPER_DIRECTORY_OBJECT, pud_pool_names)
+        
+        pd_pool_names = [f"PageDirectory: PD={pd.name} POOL" for _ in range(POOL_NUM_PAGE_DIRECTORIES)]
+        pool_objects += init_system.allocate_objects(SEL4_PAGE_DIRECTORY_OBJECT, pd_pool_names)
+        
+        pt_pool_names = [f"PageTable: PD={pd.name} POOL" for _ in range(POOL_NUM_PAGE_TABLES)]
+        pool_objects += init_system.allocate_objects(SEL4_PAGE_TABLE_OBJECT, pt_pool_names)
+        
+        p_pool_names = [f"Page: PD={pd.name} POOL" for _ in range(POOL_NUM_PAGES)]
+        pool_objects += init_system.allocate_objects(SEL4_SMALL_PAGE_OBJECT, p_pool_names)
+        
+        for idx, pool_obj in enumerate(pool_objects):
+            system_invocations.append(Sel4CnodeMove(
+                cnode_obj.cap_addr,
+                BASE_PAGING_STRUCTURE_POOL + idx, 
+                PD_CAP_BITS, 
+                root_cnode_cap, 
+                pool_obj.cap_addr,
+                kernel_config.cap_address_bits)
+            )
+    
 
+    # Create copies of all caps required via minting.
+    
+    # Mint access to the SchedControl cap for all PDs.
+    for cnode_obj in cnode_objects:
+        system_invocations.append(Sel4CnodeMint(
+            cnode_obj.cap_addr, 
+            SCHED_CONTROL_CAP_IDX, 
+            PD_CAP_BITS, 
+            INIT_CNODE_CAP_ADDRESS, 
+            kernel_boot_info.schedcontrol_cap, 
+            kernel_config.cap_address_bits, 
+            SEL4_RIGHTS_ALL, 
+            0)
+        )
+        
+    # Mint copies of required pages, while also determing what's required
+    # for later mapping
     cap_slot = init_system._cap_slot
+    page_descriptors = []
+    for pd_idx, (pd, cnode_obj) in enumerate(zip(system.protection_domains, cnode_objects)):
+        page_cap_idx = BASE_SHARED_MEMORY_REGION_PAGES
+        for mp in (pd.maps + pd_extra_maps[pd]):
+            vaddr = mp.vaddr
+            mr = all_mr_by_name[mp.mr] #system.mr_by_name[mp.mr]
+            rights = 0
+            attrs = SEL4_ARM_PARITY_ENABLED
+            if "r" in mp.perms:
+                rights |= SEL4_RIGHTS_READ
+            if "w" in mp.perms:
+                rights |= SEL4_RIGHTS_WRITE
+            if "x" not in mp.perms:
+                attrs |= SEL4_ARM_EXECUTE_NEVER
+            if mp.cached:
+                attrs |= SEL4_ARM_PAGE_CACHEABLE
 
+            assert len(mr_pages[mr]) > 0
+            assert_objects_adjacent(mr_pages[mr])
+
+            invocation = Sel4CnodeMint(
+                system_cnode_cap, cap_slot, system_cnode_bits, 
+                root_cnode_cap, mr_pages[mr][0].cap_addr, kernel_config.cap_address_bits, 
+                rights, 0
+            )
+            invocation.repeat(len(mr_pages[mr]), dest_index=1, src_obj=1)
+            system_invocations.append(invocation)
+            
+            # Ensure that the page capabilities for the memory region are available in 
+            # the BASE_SHARED_MEMORY_REGION_PAGES area. TODO: Only do this for pd.maps and not for pd_extra_maps
+            invocation = Sel4CnodeMint(
+                cnode_obj.cap_addr, page_cap_idx, PD_CAP_BITS,
+                root_cnode_cap, mr_pages[mr][0].cap_addr, kernel_config.cap_address_bits,
+                rights, 0
+            )
+            invocation.repeat(len(mr_pages[mr]), dest_index=1, src_obj=1)
+            system_invocations.append(invocation)
+
+            page_descriptors.append((
+                system_cap_address_mask | cap_slot,
+                pd_idx,
+                vaddr,
+                rights,
+                attrs,
+                len(mr_pages[mr]),
+                mr_page_bytes(mr)
+            ))
+
+            for idx in range(len(mr_pages[mr])):
+                cap_address_names[system_cap_address_mask | (cap_slot + idx)] = cap_address_names[mr_pages[mr][0].cap_addr + idx] + " (derived)"
+
+            cap_slot += len(mr_pages[mr])
+            page_cap_idx += len(mr_pages[mr])
+            
     # Create all the necessary interrupt handler objects. These aren't
     # created through retype though!
     irq_cap_addresses: Dict[ProtectionDomain, List[int]] = {pd: [] for pd in system.protection_domains}
@@ -1196,66 +1310,6 @@ def build_system(
             cap_slot += 1
             cap_address_names[cap_address] = f"IRQ Handler: irq={sysirq.irq:d}"
             irq_cap_addresses[pd].append(cap_address)
-
-    # This has to be done prior to minting!
-    invocation = Sel4AsidPoolAssign(INIT_ASID_POOL_CAP_ADDRESS, vspace_objects[0].cap_addr)
-    invocation.repeat(len(system.protection_domains), vspace=1)
-    system_invocations.append(invocation)
-
-    # Create copies of all caps required via minting.
-    
-    # Mint access to the SchedControl cap for all PDs.
-    for cnode_obj in cnode_objects:
-        system_invocations.append(Sel4CnodeMint(
-            cnode_obj.cap_addr, 
-            SCHED_CONTROL_CAP_IDX, 
-            PD_CAP_BITS, 
-            INIT_CNODE_CAP_ADDRESS, 
-            kernel_boot_info.schedcontrol_cap, 
-            kernel_config.cap_address_bits, 
-            SEL4_RIGHTS_ALL, 
-            0)
-        )
-
-    # Mint copies of required pages, while also determing what's required
-    # for later mapping
-    page_descriptors = []
-    for pd_idx, pd in enumerate(system.protection_domains):
-        for mp in (pd.maps + pd_extra_maps[pd]):
-            vaddr = mp.vaddr
-            mr = all_mr_by_name[mp.mr] #system.mr_by_name[mp.mr]
-            rights = 0
-            attrs = SEL4_ARM_PARITY_ENABLED
-            if "r" in mp.perms:
-                rights |= SEL4_RIGHTS_READ
-            if "w" in mp.perms:
-                rights |= SEL4_RIGHTS_WRITE
-            if "x" not in mp.perms:
-                attrs |= SEL4_ARM_EXECUTE_NEVER
-            if mp.cached:
-                attrs |= SEL4_ARM_PAGE_CACHEABLE
-
-            assert len(mr_pages[mr]) > 0
-            assert_objects_adjacent(mr_pages[mr])
-
-            invocation = Sel4CnodeMint(system_cnode_cap, cap_slot, system_cnode_bits, root_cnode_cap, mr_pages[mr][0].cap_addr, kernel_config.cap_address_bits, rights, 0)
-            invocation.repeat(len(mr_pages[mr]), dest_index=1, src_obj=1)
-            system_invocations.append(invocation)
-
-            page_descriptors.append((
-                system_cap_address_mask | cap_slot,
-                pd_idx,
-                vaddr,
-                rights,
-                attrs,
-                len(mr_pages[mr]),
-                mr_page_bytes(mr)
-            ))
-
-            for idx in range(len(mr_pages[mr])):
-                cap_address_names[system_cap_address_mask | (cap_slot + idx)] = cap_address_names[mr_pages[mr][0].cap_addr + idx] + " (derived)"
-
-            cap_slot += len(mr_pages[mr])
 
     badged_irq_caps: Dict[ProtectionDomain, List[int]] = {pd: [] for pd in system.protection_domains}
     for notification_obj, pd in zip(notification_objects, system.protection_domains):
@@ -1354,10 +1408,11 @@ def build_system(
         
         # Ensure that a parent PD always has an unbadged capability to all its children's
         # channel objects (notifications or endpoints).
-        # The same is the case for the BASE_CNODE_CAP area.
-        for maybe_child_pd, maybe_child_cnode_obj in zip(system.protection_domains, cnode_objects):
+        # The same is the case for the BASE_CNODE_CAP area and the BASE_VSPACE_CAP area.
+        for maybe_child_pd, maybe_child_cnode_obj, maybe_child_vspace_obj in zip(system.protection_domains, cnode_objects, vspace_objects):
             if maybe_child_pd.parent is not pd:
                 continue
+            # Add the child PD's unbadged channel capability to the BASE_UNBADGED_CHANNEL_CAP area.
             system_invocations.append(
                 Sel4CnodeMint(
                     cnode_obj.cap_addr,
@@ -1370,7 +1425,7 @@ def build_system(
                     0
                 )
             )
-            # Add the PDs own CNode capability to the BASE_CNODE_CAP area.
+            # Add the child PD's CNode capability to the BASE_CNODE_CAP area.
             system_invocations.append(
                 Sel4CnodeMint(
                     cnode_obj.cap_addr,
@@ -1383,8 +1438,19 @@ def build_system(
                     0
                 )
             )
-       # TODO: Do the setup for non-child PDs which have explicitly been marked
-       # as being managed by the current PD.
+            # Add the child PD's VSpace capability to the BASE_VSPACE_CAP area.
+            system_invocations.append(
+                Sel4CnodeMint(
+                    cnode_obj.cap_addr,
+                    BASE_VSPACE_CAP + maybe_child_pd.pd_id,
+                    PD_CAP_BITS,
+                    root_cnode_cap,
+                    maybe_child_vspace_obj.cap_addr,
+                    kernel_config.cap_address_bits,
+                    SEL4_RIGHTS_ALL,
+                    0
+                )
+            )
     
 
     assert REPLY_CAP_IDX < PD_CAP_SIZE
@@ -1545,7 +1611,7 @@ def build_system(
             system_invocations.append(Sel4IrqHandlerSetNotification(irq_cap_address, badged_notification_cap_address))
 
 
-    # Initialise the VSpaces -- assign them all the the initial asid pool.
+    # Initialise the VSpaces -- assign them all to the initial asid pool.
     for map_cls, descriptors, objects in [
         (Sel4PageUpperDirectoryMap, uds, ud_objects),
         (Sel4PageDirectoryMap, ds, d_objects),
@@ -1562,7 +1628,7 @@ def build_system(
                 )
             )
 
-    # Now maps all the pages
+    # Now map all the pages
     for page_cap_address, pd_idx, vaddr, rights, attrs, count, vaddr_incr in page_descriptors:
         vspace_obj = vspace_objects[pd_idx]
         invocation = Sel4PageMap(page_cap_address, vspace_obj.cap_addr, vaddr, rights, attrs)

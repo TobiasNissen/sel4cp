@@ -624,6 +624,19 @@ class Sel4CnodeMint(Sel4Invocation):
     src_depth: int
     rights: int
     badge: int
+    
+@dataclass
+class Sel4CnodeMove(Sel4Invocation):
+    _object_type = "CNode"
+    _method_name = "Move"
+    _extra_caps = ("src_root", )
+    label = Sel4Label.CNodeMove
+    cnode: int
+    dest_index: int
+    dest_depth: int
+    src_root: int
+    src_obj: int
+    src_depth: int
 
 
 @dataclass
