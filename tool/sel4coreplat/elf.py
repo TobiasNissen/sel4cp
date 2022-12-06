@@ -416,15 +416,6 @@ class ElfFile:
                 assert len(data) <= size
                 seg.data[offset:offset+len(data)] = data
 
-
-    # def read(self, offset: int, size: int) -> bytes:
-    #     self._f.seek(offset)
-    #     return self._f.read(size)
-
-    # def _get_sh_string(self, idx: int) -> str:
-    #     end_idx = self._shstrtab.find(0, idx)
-    #     return self._shstrtab[idx:end_idx].decode("ascii")
-
     @staticmethod
     def _get_string(strtab: bytes, idx: int) -> str:
         end_idx = strtab.find(0, idx)
@@ -440,11 +431,13 @@ class ElfFile:
                     raise Exception(f"Multiple symbols with name {variable_name}")
         if found_sym is None:
             raise KeyError(f"No symbol named {variable_name} found")
-        # symbol_type = found_sym.info & 0xf
-        # symbol_binding = found_sym.info >> 4
-        #if symbol_type != 1:
-        #    raise Exception(f"Unexpected symbol type {symbol_type}. Expect STT_OBJECT")
         return found_sym.value, found_sym.size
+        
+    def has_symbol(self, variable_name: str) -> bool:
+        for name, sym in self._symbols:
+            if name == variable_name:
+                return True
+        return False
 
     def read_struct(self, variable_name: str, struct_: Struct) -> Tuple[int, ...]:
         vaddr, size = self.find_symbol(variable_name)

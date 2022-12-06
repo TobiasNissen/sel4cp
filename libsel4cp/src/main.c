@@ -23,6 +23,8 @@
 char _stack[4096]  __attribute__((__aligned__(16)));
 
 char sel4cp_name[16];
+sel4cp_pd current_pd_id;
+uint8_t *sel4cp_internal_loader_temp_page_vaddr;
 
 extern seL4_IPCBuffer __sel4_ipc_buffer_obj;
 

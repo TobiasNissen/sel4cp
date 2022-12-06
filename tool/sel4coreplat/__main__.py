@@ -162,8 +162,8 @@ INPUT_CAP_IDX = 1 # Will be either the notification or endpoint cap
 FAULT_EP_CAP_IDX = 2
 VSPACE_CAP_IDX = 3
 REPLY_CAP_IDX = 4
-TCB_CAP_IDX = 5 # the index of the capability to the PD's own TCB.
 SCHED_CONTROL_CAP_IDX = 6
+LOADER_TEMP_PAGE_CAP = 8
 BASE_OUTPUT_NOTIFICATION_CAP = 10
 BASE_OUTPUT_ENDPOINT_CAP = BASE_OUTPUT_NOTIFICATION_CAP + 64
 BASE_IRQ_CAP = BASE_OUTPUT_ENDPOINT_CAP + 64
@@ -1378,8 +1378,8 @@ def build_system(
         )
     
     # Setup the BASE_UNBADGED_CHANNEL_CAP and BASE_CNODE_CAP areas.
-    for pd, cnode_obj in zip(system.protection_domains, cnode_objects):
-        # Add the PDs own channel capability to the BASE_UNBADGED_CHANNEL_CAP area.
+    for pd, cnode_obj, vspace_obj in zip(system.protection_domains, cnode_objects, vspace_objects):
+        # Add the PD's own channel capability to the BASE_UNBADGED_CHANNEL_CAP area.
         system_invocations.append(
             Sel4CnodeMint(
                 cnode_obj.cap_addr,
@@ -1392,7 +1392,7 @@ def build_system(
                 0
             )
         )
-        # Add the PDs own CNode capability to the BASE_CNODE_CAP area.
+        # Add the PD's own CNode capability to the BASE_CNODE_CAP area.
         system_invocations.append(
             Sel4CnodeMint(
                 cnode_obj.cap_addr,
@@ -1400,6 +1400,19 @@ def build_system(
                 PD_CAP_BITS,
                 root_cnode_cap,
                 cnode_obj.cap_addr,
+                kernel_config.cap_address_bits,
+                SEL4_RIGHTS_ALL,
+                0
+            )
+        )
+        # Add the PD's own VSpace capability to the BASE_VSPACE_CAP area.
+        system_invocations.append(
+            Sel4CnodeMint(
+                cnode_obj.cap_addr,
+                BASE_VSPACE_CAP + pd.pd_id,
+                PD_CAP_BITS,
+                root_cnode_cap,
+                vspace_obj.cap_addr,
                 kernel_config.cap_address_bits,
                 SEL4_RIGHTS_ALL,
                 0
@@ -1515,7 +1528,7 @@ def build_system(
                 system_invocations.append(
                     Sel4CnodeMint(
                         cnode_obj.cap_addr,
-                        TCB_CAP_IDX,
+                        BASE_TCB_CAP + pd.pd_id,
                         PD_CAP_BITS,
                         root_cnode_cap,
                         maybe_child_tcb.cap_addr,
@@ -1721,6 +1734,25 @@ def build_system(
         if pd.program_image is not None:
             # Could use pd.elf_file.write_symbol here to update variables if required.
             pd_elf_files[pd].write_symbol("sel4cp_name", pack("<16s", pd.name.encode("utf8")))
+    
+    # Set the virtual address for the page used for dynamically loading ELF files.
+    # NB: The page is intentionally not allocated to avoid overhead for PDs that
+    # do not need to dynamically load other programs.
+    # Furthermore, set the pd_id for each PD.
+    for pd in system.protection_domains:
+        if pd.program_image is None:
+            continue # empty PDs do not have an ELF file that can be patched.
+        pd_elf_file = pd_elf_files[pd]
+        
+        # The IPC buffer is always at a page after the ELF file, 
+        # so we use the page following this one for the loader page.
+        if pd_elf_file.has_symbol("sel4cp_internal_loader_temp_page_vaddr"):
+            ipc_buffer_vaddr, _ = pd_elf_file.find_symbol("__sel4_ipc_buffer_obj")
+            loader_temp_page_vaddr = ipc_buffer_vaddr + 0x1000 
+            pd_elf_file.write_symbol("sel4cp_internal_loader_temp_page_vaddr", pack("<Q", loader_temp_page_vaddr))
+        
+        if pd_elf_file.has_symbol("current_pd_id"):
+            pd_elf_file.write_symbol("current_pd_id", pack("<B", pd.pd_id))
 
     for pd in system.protection_domains:
         for setvar in pd.setvars:
