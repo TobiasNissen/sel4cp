@@ -160,10 +160,9 @@ POOL_NUM_PAGES = 100
 
 INPUT_CAP_IDX = 1 # Will be either the notification or endpoint cap
 FAULT_EP_CAP_IDX = 2
-VSPACE_CAP_IDX = 3
 REPLY_CAP_IDX = 4
 SCHED_CONTROL_CAP_IDX = 6
-LOADER_TEMP_PAGE_CAP = 8
+TEMP_CAP = 8 # CSlot reserved for temporary capabilities.
 BASE_OUTPUT_NOTIFICATION_CAP = 10
 BASE_OUTPUT_ENDPOINT_CAP = BASE_OUTPUT_NOTIFICATION_CAP + 64
 BASE_IRQ_CAP = BASE_OUTPUT_ENDPOINT_CAP + 64
@@ -1471,12 +1470,6 @@ def build_system(
     invocation.repeat(len(system.protection_domains), cnode=1, src_obj=1)
     system_invocations.append(invocation)
 
-    ## Mint access to the vspace cap
-    assert VSPACE_CAP_IDX < PD_CAP_SIZE
-    invocation = Sel4CnodeMint(cnode_objects[0].cap_addr, VSPACE_CAP_IDX, PD_CAP_BITS, root_cnode_cap, vspace_objects[0].cap_addr, kernel_config.cap_address_bits, SEL4_RIGHTS_ALL, 0)
-    invocation.repeat(len(system.protection_domains), cnode=1, src_obj=1)
-    system_invocations.append(invocation)
-
     ## Mint access to interrupt handlers in the PD Cspace
     for cnode_obj, pd in zip(cnode_objects, system.protection_domains):
         for sysirq, irq_cap_address in zip(pd.irqs, irq_cap_addresses[pd]):
@@ -1618,7 +1611,6 @@ def build_system(
     # All minting is complete at this point
 
     # Associate badges
-    # FIXME: This could use repeat
     for notification_obj, pd in zip(notification_objects, system.protection_domains):
         for irq_cap_address, badged_notification_cap_address in zip(irq_cap_addresses[pd], badged_irq_caps[pd]):
             system_invocations.append(Sel4IrqHandlerSetNotification(irq_cap_address, badged_notification_cap_address))
@@ -1751,8 +1743,8 @@ def build_system(
             loader_temp_page_vaddr = ipc_buffer_vaddr + 0x1000 
             pd_elf_file.write_symbol("sel4cp_internal_loader_temp_page_vaddr", pack("<Q", loader_temp_page_vaddr))
         
-        if pd_elf_file.has_symbol("current_pd_id"):
-            pd_elf_file.write_symbol("current_pd_id", pack("<B", pd.pd_id))
+        if pd_elf_file.has_symbol("sel4cp_current_pd_id"):
+            pd_elf_file.write_symbol("sel4cp_current_pd_id", pack("<B", pd.pd_id))
 
     for pd in system.protection_domains:
         for setvar in pd.setvars:
