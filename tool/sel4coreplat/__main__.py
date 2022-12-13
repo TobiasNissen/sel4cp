@@ -152,15 +152,22 @@ MONITOR_CONFIG = MonitorConfig(
     system_invocation_count_symbol_name = "system_invocation_count",
 )
 
-# TODO: Get the following values from the system configuration instead of hardcoding them here.
-POOL_NUM_PAGE_UPPER_DIRECTORIES = 5
-POOL_NUM_PAGE_DIRECTORIES = 5
-POOL_NUM_PAGE_TABLES = 10
-POOL_NUM_PAGES = 100
+POOL_NUM_PD_TARGETS = 5
+
+POOL_NUM_TCBS = POOL_NUM_PD_TARGETS
+POOL_NUM_NOTIFICATIONS = POOL_NUM_PD_TARGETS
+POOL_NUM_CNODES = POOL_NUM_PD_TARGETS
+POOL_NUM_SCHEDCONTEXTS = POOL_NUM_PD_TARGETS
+POOL_NUM_VSPACES = POOL_NUM_PD_TARGETS
+POOL_NUM_PAGE_UPPER_DIRECTORIES = POOL_NUM_PD_TARGETS * 2
+POOL_NUM_PAGE_DIRECTORIES = POOL_NUM_PD_TARGETS * 4
+POOL_NUM_PAGE_TABLES = POOL_NUM_PD_TARGETS * 6
+POOL_NUM_PAGES = POOL_NUM_PD_TARGETS * 20
 
 INPUT_CAP_IDX = 1 # Will be either the notification or endpoint cap
 FAULT_EP_CAP_IDX = 2
 REPLY_CAP_IDX = 4
+ASID_POOL_CAP_IDX = 5
 SCHED_CONTROL_CAP_IDX = 6
 TEMP_CAP = 8 # CSlot reserved for temporary capabilities.
 BASE_OUTPUT_NOTIFICATION_CAP = 10
@@ -171,8 +178,16 @@ BASE_SCHED_CONTEXT_CAP = BASE_TCB_CAP + 64
 BASE_UNBADGED_CHANNEL_CAP = BASE_SCHED_CONTEXT_CAP + 64
 BASE_CNODE_CAP = BASE_UNBADGED_CHANNEL_CAP + 64
 BASE_VSPACE_CAP = BASE_CNODE_CAP + 64
-BASE_PAGING_STRUCTURE_POOL = BASE_VSPACE_CAP + 64
-BASE_SHARED_MEMORY_REGION_PAGES = BASE_PAGING_STRUCTURE_POOL + POOL_NUM_PAGE_UPPER_DIRECTORIES + POOL_NUM_PAGE_DIRECTORIES + POOL_NUM_PAGE_TABLES + POOL_NUM_PAGES
+BASE_TCB_POOL = BASE_VSPACE_CAP + 64
+BASE_NOTIFICATION_POOL = BASE_TCB_POOL + POOL_NUM_TCBS
+BASE_CNODE_POOL = BASE_NOTIFICATION_POOL + POOL_NUM_NOTIFICATIONS
+BASE_SCHEDCONTEXT_POOL = BASE_CNODE_POOL + POOL_NUM_CNODES
+BASE_VSPACE_POOL = BASE_SCHEDCONTEXT_POOL + POOL_NUM_SCHEDCONTEXTS
+BASE_PAGE_UPPER_DIRECTORY_POOL = BASE_VSPACE_POOL + POOL_NUM_VSPACES
+BASE_PAGE_DIRECTORY_POOL = BASE_PAGE_UPPER_DIRECTORY_POOL + POOL_NUM_PAGE_UPPER_DIRECTORIES
+BASE_PAGE_TABLE_POOL = BASE_PAGE_DIRECTORY_POOL + POOL_NUM_PAGE_DIRECTORIES
+BASE_PAGE_POOL = BASE_PAGE_TABLE_POOL + POOL_NUM_PAGE_TABLES
+BASE_SHARED_MEMORY_REGION_PAGES = BASE_PAGE_POOL + POOL_NUM_PAGES
 
 MAX_SYSTEM_INVOCATION_SIZE = mb(128)
 PD_CAP_SIZE = 2048
@@ -592,6 +607,24 @@ class InitSystem:
 
         self._objects += kernel_objects
         return kernel_objects
+    
+        
+    def allocate_pool_objects(self, object_name: str, object_type: int, num_objects: int, cap_base_address: int,
+                          cnode_object: KernelObject, size: Optional[int] = None) -> List[KernelObject]:
+        pool_object_names = [f"{object_name}: POOL" for _ in range(num_objects)]
+        pool_objects = self.allocate_objects(object_type, pool_object_names, size)
+        for idx, pool_object in enumerate(pool_objects):
+            self._invocations.append(
+                Sel4CnodeMove(
+                    cnode_object.cap_addr,
+                    cap_base_address + idx,
+                    PD_CAP_BITS, 
+                    self._cnode_cap, 
+                    pool_object.cap_addr, 
+                    self._kernel_config.cap_address_bits
+                )
+            )
+        return pool_objects
 
 
 @dataclass(frozen=True)
@@ -629,6 +662,7 @@ def _get_full_path(filename: Path, search_paths: List[Path]) -> Path:
             return full_path
     else:
         raise UserError(f"Error: unable to find program image: '{filename}'")
+    
 
 
 def build_system(
@@ -1190,33 +1224,18 @@ def build_system(
     system_invocations.append(invocation)
     
     
-    # Allocate the pool of unused paging structures for each PD.
-    # Furthermore, ensure that each PD can access the pool by minting capabilities into its CSpace.
-    for pd, cnode_obj in zip(system.protection_domains, cnode_objects):
-        pool_objects = []
-        
-        pud_pool_names = [f"PageUpperDirectory: PD={pd.name} POOL" for _ in range(POOL_NUM_PAGE_UPPER_DIRECTORIES)]
-        pool_objects += init_system.allocate_objects(SEL4_PAGE_UPPER_DIRECTORY_OBJECT, pud_pool_names)
-        
-        pd_pool_names = [f"PageDirectory: PD={pd.name} POOL" for _ in range(POOL_NUM_PAGE_DIRECTORIES)]
-        pool_objects += init_system.allocate_objects(SEL4_PAGE_DIRECTORY_OBJECT, pd_pool_names)
-        
-        pt_pool_names = [f"PageTable: PD={pd.name} POOL" for _ in range(POOL_NUM_PAGE_TABLES)]
-        pool_objects += init_system.allocate_objects(SEL4_PAGE_TABLE_OBJECT, pt_pool_names)
-        
-        p_pool_names = [f"Page: PD={pd.name} POOL" for _ in range(POOL_NUM_PAGES)]
-        pool_objects += init_system.allocate_objects(SEL4_SMALL_PAGE_OBJECT, p_pool_names)
-        
-        for idx, pool_obj in enumerate(pool_objects):
-            system_invocations.append(Sel4CnodeMove(
-                cnode_obj.cap_addr,
-                BASE_PAGING_STRUCTURE_POOL + idx, 
-                PD_CAP_BITS, 
-                root_cnode_cap, 
-                pool_obj.cap_addr,
-                kernel_config.cap_address_bits)
-            )
-    
+    # Allocate the pools of unused objects for all PDs.
+    for cnode_obj in cnode_objects: 
+        init_system.allocate_pool_objects("TCB", SEL4_TCB_OBJECT, POOL_NUM_TCBS, BASE_TCB_POOL, cnode_obj)
+        init_system.allocate_pool_objects("Notification", SEL4_NOTIFICATION_OBJECT, POOL_NUM_NOTIFICATIONS, BASE_NOTIFICATION_POOL, cnode_obj)
+        init_system.allocate_pool_objects("CNode", SEL4_CNODE_OBJECT, POOL_NUM_CNODES, BASE_CNODE_POOL, cnode_obj, PD_CAP_SIZE)
+        init_system.allocate_pool_objects("SchedContext", SEL4_SCHEDCONTEXT_OBJECT, POOL_NUM_SCHEDCONTEXTS, BASE_SCHEDCONTEXT_POOL, cnode_obj, PD_SCHEDCONTEXT_SIZE)
+        init_system.allocate_pool_objects("VSpace", SEL4_VSPACE_OBJECT, POOL_NUM_VSPACES, BASE_VSPACE_POOL, cnode_obj)
+        init_system.allocate_pool_objects("PageUpperDirectory", SEL4_PAGE_UPPER_DIRECTORY_OBJECT, POOL_NUM_PAGE_UPPER_DIRECTORIES, BASE_PAGE_UPPER_DIRECTORY_POOL, cnode_obj)
+        init_system.allocate_pool_objects("PageDirectory", SEL4_PAGE_DIRECTORY_OBJECT, POOL_NUM_PAGE_DIRECTORIES, BASE_PAGE_DIRECTORY_POOL, cnode_obj)
+        init_system.allocate_pool_objects("PageTable", SEL4_PAGE_TABLE_OBJECT, POOL_NUM_PAGE_TABLES, BASE_PAGE_TABLE_POOL, cnode_obj)
+        init_system.allocate_pool_objects("Page", SEL4_SMALL_PAGE_OBJECT, POOL_NUM_PAGES, BASE_PAGE_POOL, cnode_obj)
+
 
     # Create copies of all caps required via minting.
     
@@ -1373,7 +1392,23 @@ def build_system(
                 obj.cap_addr,
                 kernel_config.cap_address_bits,
                 SEL4_RIGHTS_ALL,
-                0)
+                0
+            )
+        )
+   
+    # Mint access for each PD to the ASID pool
+    for pd, cnode_obj in zip(system.protection_domains, cnode_objects):
+        system_invocations.append(
+            Sel4CnodeMint(
+                cnode_obj.cap_addr,
+                ASID_POOL_CAP_IDX,
+                PD_CAP_BITS,
+                INIT_CNODE_CAP_ADDRESS,
+                INIT_ASID_POOL_CAP_ADDRESS,
+                kernel_config.cap_address_bits,
+                SEL4_RIGHTS_ALL,
+                0
+            )
         )
     
     # Setup the BASE_UNBADGED_CHANNEL_CAP and BASE_CNODE_CAP areas.
@@ -1616,7 +1651,7 @@ def build_system(
             system_invocations.append(Sel4IrqHandlerSetNotification(irq_cap_address, badged_notification_cap_address))
 
 
-    # Initialise the VSpaces -- assign them all to the initial asid pool.
+    # Initialise the VSpaces.
     for map_cls, descriptors, objects in [
         (Sel4PageUpperDirectoryMap, uds, ud_objects),
         (Sel4PageDirectoryMap, ds, d_objects),
