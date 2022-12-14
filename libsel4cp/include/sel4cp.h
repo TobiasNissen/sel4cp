@@ -21,6 +21,9 @@
 #define P_FLAGS_EXECUTABLE 1 // Bit indicating that a segment should be executable.
 #define P_FLAGS_WRITABLE 2 // Bit indicating that a segment should be writable.
 #define P_FLAGS_READABLE 4 // Bit indicating that a segment should be readable.
+#define SHT_SYMTAB 2 // the identifier for a symbol table section.
+#define SHT_STRTAB 3 // the identifier for a string table section.
+
 
 // Constants related to the protection model.
 #define SCHEDULING_ID 0
@@ -108,6 +111,31 @@ typedef struct {
     uint64_t p_align;
 } elf_program_header;
 typedef struct {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint64_t sh_flags;
+    uint64_t sh_addr;
+    uint64_t sh_offset;
+    uint64_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint64_t sh_addralign;
+    uint64_t sh_entsize;
+} elf_section_header;
+typedef struct {
+    uint32_t st_name;
+    uint8_t st_info;
+    uint8_t st_other;
+    uint16_t st_shndx;
+    uint64_t st_value;
+    uint64_t st_size;
+} elf_symbol_table_entry;
+typedef struct {
+    uint64_t tcb_idx;
+    uint64_t notification_idx;    
+    uint64_t cnode_idx;
+    uint64_t schedcontext_idx;
+    uint64_t vspace_idx;    
     uint64_t page_upper_directory_idx;
     uint64_t page_directory_idx;
     uint64_t page_table_idx;
@@ -116,9 +144,15 @@ typedef struct {
 } allocation_state;
 
 static allocation_state alloc_state = { 
+    .tcb_idx = 0,
+    .notification_idx = 0,
+    .cnode_idx = 0,
+    .schedcontext_idx = 0,
+    .vspace_idx = 0,
     .page_upper_directory_idx = 0,
     .page_directory_idx = 0,
     .page_table_idx = 0,
+    .page_idx = 0,
     .loader_temp_page_allocated = false
 };
 
@@ -157,7 +191,7 @@ static inline void
 sel4cp_internal_crash(seL4_Error err)
 {
     /*
-     * Currently crash be dereferencing NULL page
+     * Currently crash by dereferencing NULL page
      *
      * Actually derference 'err' which means the crash reporting will have
      * `err` as the fault address. A bit of a cute hack. Not a good long term
@@ -187,9 +221,16 @@ sel4cp_internal_delete_temp_cap(void) {
 }
 
 static void
-sel4cp_internal_set_priority(sel4cp_pd pd, uint8_t priority)
+sel4cp_internal_set_priority(sel4cp_pd pd, uint8_t priority, uint8_t mcp)
 {
-    seL4_Error err = seL4_TCB_SetPriority(BASE_TCB_CAP + pd, BASE_TCB_CAP + sel4cp_current_pd_id, priority);
+    seL4_Error err = seL4_TCB_SetSchedParams(
+        BASE_TCB_CAP + pd, 
+        BASE_TCB_CAP + sel4cp_current_pd_id, 
+        mcp, 
+        priority,
+        BASE_SCHEDCONTEXT_POOL + alloc_state.schedcontext_idx - 1,
+        FAULT_EP_CAP_IDX
+    );
     if (err != seL4_NoError) {
         sel4cp_dbg_puts("sel4cp_internal_set_priority: error setting priority\n");
         sel4cp_internal_crash(err);
@@ -344,7 +385,7 @@ sel4cp_internal_parse_vm_attributes(uint8_t memory_flags, bool cached)
 /**
  *  Ensures that all higher-level paging structures in the ARM AArch64 four-level
  *  page-table structure required to map a page at the given virtual address in the given
- *  PD are mapped.
+ *  PD VSpace are mapped.
  *
  *  The bits in a virtual address are given the following meaning:
  *      -  0-11: offset into a page.
@@ -355,10 +396,8 @@ sel4cp_internal_parse_vm_attributes(uint8_t memory_flags, bool cached)
  *  Note that the VSpace is a page global directory in seL4 for ARM AArch64.
  */
 static int 
-sel4cp_internal_set_up_required_paging_structures(uint64_t vaddr, sel4cp_pd pd) 
-{
-    uint64_t pd_vspace_cap = BASE_VSPACE_CAP + pd;
-    
+sel4cp_internal_set_up_required_paging_structures(uint64_t vaddr, uint64_t pd_vspace_cap) 
+{    
     // Ensure that the required page upper directory is mapped.
     uint64_t page_upper_directory_vaddr = sel4cp_internal_mask_bits(vaddr, 12 + 9 + 9 + 9);
     if (alloc_state.page_upper_directory_idx >= POOL_NUM_PAGE_UPPER_DIRECTORIES) {
@@ -429,20 +468,17 @@ sel4cp_internal_set_up_required_paging_structures(uint64_t vaddr, sel4cp_pd pd)
 }
 
 /**
- *  Returns a virtual address in the current PD which
- *  can be used to write data that will be available at the
- *  given vaddr in the given pd.
- *  The required paging structures are automatically allocated,
- *  and the page is mapped with the given ELF program header p_flags.
+ *  Allocates a page and maps it at the given virtual address in the given VSpace. 
+ *  The page is mapped with the given ELF program header p_flags.
  *
- *  Returns NULL if the allocation fails. 
- *  Nothing is done to clean up in this case.
+ *  Returns the index of the CSlot containing the allocated page in the current PD on success.
+ *  Returns 0 if an error occurs.
  */
-static uint8_t *
-sel4cp_internal_allocate_page(uint64_t vaddr, sel4cp_pd pd, uint32_t p_flags) 
+static uint64_t
+sel4cp_internal_allocate_page(uint64_t vaddr, uint64_t pd_vspace_cap, uint32_t p_flags)
 {
-    if (sel4cp_internal_set_up_required_paging_structures(vaddr, pd)) {
-        return NULL;
+    if (sel4cp_internal_set_up_required_paging_structures(vaddr, pd_vspace_cap)) {
+        return 0;
     }
     
     // Extract the rights and VM attributes to map the required page with 
@@ -454,11 +490,11 @@ sel4cp_internal_allocate_page(uint64_t vaddr, sel4cp_pd pd, uint32_t p_flags)
     uint64_t page_vaddr = sel4cp_internal_mask_bits(vaddr, 12);
     if (alloc_state.page_idx >= POOL_NUM_PAGES) {
         sel4cp_dbg_puts("sel4cp_internal_allocate_page: no pages are available; allocate more and try again\n");
-        return NULL;
+        return 0;
     }
     seL4_Error err = seL4_ARM_Page_Map(
         BASE_PAGE_POOL + alloc_state.page_idx,
-        BASE_VSPACE_CAP + pd,
+        pd_vspace_cap,
         page_vaddr,
         rights,
         vm_attributes
@@ -470,11 +506,32 @@ sel4cp_internal_allocate_page(uint64_t vaddr, sel4cp_pd pd, uint32_t p_flags)
         sel4cp_dbg_puts("sel4cp_internal_allocate_page: failed to allocate a required page; error code = ");
         sel4cp_dbg_puthex64(err);
         sel4cp_dbg_puts("\n");
+        return 0;
+    }
+    
+    return BASE_PAGE_POOL + alloc_state.page_idx - 1;
+}
+
+/**
+ *  Returns a virtual address in the current PD which
+ *  can be used to write data that will be available at the
+ *  given vaddr in the given pd_vspace.
+ *  The required paging structures are automatically allocated,
+ *  and the page is mapped with the given ELF program header p_flags.
+ *
+ *  Returns NULL if the allocation fails. 
+ *  Nothing is done to clean up in this case.
+ */
+static uint8_t *
+sel4cp_internal_allocate_page_with_write_handle(uint64_t vaddr, uint64_t pd_vspace_cap, uint32_t p_flags) 
+{
+    uint64_t allocated_page_idx = sel4cp_internal_allocate_page(vaddr, pd_vspace_cap, p_flags);
+    if (allocated_page_idx == 0) {
         return NULL;
     }
     
     if (!alloc_state.loader_temp_page_allocated) {
-        if (sel4cp_internal_set_up_required_paging_structures((uint64_t)sel4cp_internal_loader_temp_page_vaddr, sel4cp_current_pd_id)) {
+        if (sel4cp_internal_set_up_required_paging_structures((uint64_t)sel4cp_internal_loader_temp_page_vaddr, BASE_VSPACE_CAP + sel4cp_current_pd_id)) {
             return NULL;
         }
         alloc_state.loader_temp_page_allocated = true;
@@ -484,12 +541,12 @@ sel4cp_internal_allocate_page(uint64_t vaddr, sel4cp_pd pd, uint32_t p_flags)
     sel4cp_internal_delete_temp_cap();
     
     // Copy the capability for the allocated page to the temporary page cap CSlot.
-    err = seL4_CNode_Copy(
+    seL4_Error err = seL4_CNode_Copy(
         BASE_CNODE_CAP + sel4cp_current_pd_id,
         TEMP_CAP,
         PD_CAP_BITS,
         BASE_CNODE_CAP + sel4cp_current_pd_id,
-        BASE_PAGE_POOL + alloc_state.page_idx - 1,
+        allocated_page_idx,
         PD_CAP_BITS,
         seL4_AllRights
     );
@@ -541,16 +598,19 @@ sel4cp_internal_set_up_capabilities(uint8_t *elf_file, sel4cp_pd pd)
         switch (cap_type_id) {
             case SCHEDULING_ID: {
                 uint8_t priority = *cap_reader++;
+                uint8_t mcp = *cap_reader++;
                 uint64_t budget = *((uint64_t *)cap_reader);
                 cap_reader += 8;
                 uint64_t period = *((uint64_t *)cap_reader);
                 cap_reader += 8;
                 
-                sel4cp_internal_set_priority(pd, priority);
+                sel4cp_internal_set_priority(pd, priority, mcp);
                 sel4cp_internal_set_sched_flags(pd, budget, period);
                 
                 sel4cp_dbg_puts("sel4cp_internal_set_up_capabilities: set scheduling parameters, priority = ");
                 sel4cp_dbg_puthex64(priority);
+                sel4cp_dbg_puts(" , mcp = ");
+                sel4cp_dbg_puthex64(mcp);
                 sel4cp_dbg_puts(" , budget = ");
                 sel4cp_dbg_puthex64(budget);
                 sel4cp_dbg_puts(" , period = ");
@@ -601,9 +661,8 @@ sel4cp_internal_set_up_capabilities(uint8_t *elf_file, sel4cp_pd pd)
                     sel4cp_dbg_puthex64(page_cap);
                     sel4cp_dbg_puts("\n");
                     
-                    // Ensure that all required higher-level paging structures are mapped before
-                    // mapping this page.
-                    if (sel4cp_internal_set_up_required_paging_structures(page_vaddr, pd)) {
+                    // Ensure that all required higher-level paging structures are mapped before mapping this page.
+                    if (sel4cp_internal_set_up_required_paging_structures(page_vaddr, BASE_VSPACE_CAP + pd)) {
                         return -1;
                     }
                     
@@ -654,6 +713,90 @@ sel4cp_internal_set_up_capabilities(uint8_t *elf_file, sel4cp_pd pd)
                 sel4cp_dbg_puts("\n");
                 return -1;
         }
+    }
+    
+    return 0;
+}
+
+/**
+ *  Returns true if the given strings are equal.
+ *  Precondition: The two strings are both 0-terminated.
+ */
+static bool
+sel4cp_internal_are_equal(char *a, char *b) {
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    while (*a != '\0' && *b != '\0') {
+        if (*a != *b) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static int
+sel4cp_internal_set_up_ipc_buffer(uint8_t *src, sel4cp_pd pd)
+{
+    elf_header *elf_hdr = (elf_header *)src;
+    
+    // Find the symbol table.
+    elf_section_header *symbol_table_hdr = NULL;
+    for (uint64_t i = 0; i < elf_hdr->e_shnum; i++) {
+        elf_section_header *section_hdr = (elf_section_header *)(src + elf_hdr->e_shoff + (i * elf_hdr->e_shentsize));
+        
+        if (section_hdr->sh_type == SHT_SYMTAB) {
+            symbol_table_hdr = section_hdr;
+            break;
+        }
+    }
+    if (symbol_table_hdr == NULL) {
+        sel4cp_dbg_puts("sel4cp_internal_set_up_ipc_buffer: failed to find the symbol table\n");
+        return -1;
+    }
+    
+    // Get the associated string table.
+    elf_section_header *string_table_hdr = (elf_section_header *)(src + elf_hdr->e_shoff + (symbol_table_hdr->sh_link * elf_hdr->e_shentsize));
+    
+    // Find the __sel4_ipc_buffer_obj symbol.
+    uint8_t *ipc_buffer_vaddr = NULL; 
+    elf_symbol_table_entry *symbol_table_entry = (elf_symbol_table_entry *)(src + symbol_table_hdr->sh_offset);
+    uint8_t *symbol_table_end = src + symbol_table_hdr->sh_offset + symbol_table_hdr->sh_size; 
+    while (((uint8_t *)symbol_table_entry) < symbol_table_end) { 
+        uint8_t *symbol_name = src + string_table_hdr->sh_offset + symbol_table_entry->st_name;   
+        if (sel4cp_internal_are_equal("__sel4_ipc_buffer_obj", (char *)symbol_name)) {
+            ipc_buffer_vaddr = (uint8_t *)symbol_table_entry->st_value;
+            break;
+        }
+        symbol_table_entry++;
+    }
+    if (ipc_buffer_vaddr == NULL) {
+        sel4cp_dbg_puts("sel4cp_internal_set_up_ipc_buffer: failed to find the __sel4_ipc_buffer_obj symbol\n");
+        return -1;
+    }
+    
+    // Allocate the IPC buffer.
+    uint64_t ipc_buffer_cap_idx = sel4cp_internal_allocate_page(
+        (uint64_t) ipc_buffer_vaddr, 
+        BASE_VSPACE_CAP + pd, 
+        P_FLAGS_WRITABLE | P_FLAGS_READABLE
+    );
+    if (ipc_buffer_cap_idx == 0) {
+        sel4cp_dbg_puts("sel4cp_internal_set_up_ipc_buffer: failed to allocate a page for the IPC buffer of the PD\n");
+        return -1;
+    }
+    
+    // Set the IPC buffer for the new PD.
+    seL4_Error err = seL4_TCB_SetIPCBuffer(
+        BASE_TCB_CAP + pd,
+        (uint64_t) ipc_buffer_vaddr,
+        ipc_buffer_cap_idx
+    );
+    if (err != seL4_NoError) {
+        sel4cp_dbg_puts("sel4cp_internal_set_up_ipc_buffer: failed to set the IPC buffer of the PD\n");
+        return -1;
     }
     
     return 0;
@@ -760,7 +903,7 @@ sel4cp_pd_load_elf(uint8_t *src, sel4cp_pd pd, uint64_t *entry_point)
         if (prog_hdr->p_type != PT_LOAD)
             continue; // the segment should not be loaded.
         
-        uint8_t *dst_write = sel4cp_internal_allocate_page(prog_hdr->p_vaddr, pd, prog_hdr->p_flags);
+        uint8_t *dst_write = sel4cp_internal_allocate_page_with_write_handle(prog_hdr->p_vaddr, BASE_VSPACE_CAP + pd, prog_hdr->p_flags);
         if (dst_write == NULL) {
             sel4cp_dbg_puts("sel4cp_pd_load_elf: failed to allocate a page required to load the ELF file\n");
             return -1;
@@ -776,7 +919,7 @@ sel4cp_pd_load_elf(uint8_t *src, sel4cp_pd pd, uint64_t *entry_point)
             current_vaddr++;
             if (current_vaddr % 0x1000 == 0) { // assuming a page size of 0x1000 bytes (4 KiB).
                 // Allocate a new page.
-                dst_write = sel4cp_internal_allocate_page(current_vaddr, pd, prog_hdr->p_flags);
+                dst_write = sel4cp_internal_allocate_page_with_write_handle(current_vaddr, BASE_VSPACE_CAP + pd, prog_hdr->p_flags);
                 if (dst_write == NULL) {
                     sel4cp_dbg_puts("sel4cp_pd_load_elf: failed to allocate a page required to load the ELF file\n");
                     return -1;
@@ -792,7 +935,7 @@ sel4cp_pd_load_elf(uint8_t *src, sel4cp_pd pd, uint64_t *entry_point)
                 current_vaddr++;
                 if (current_vaddr % 0x1000 == 0) { // assuming a page size of 0x1000 bytes (4 KiB).
                     // Allocate a new page.
-                    dst_write = sel4cp_internal_allocate_page(current_vaddr, pd, prog_hdr->p_flags);
+                    dst_write = sel4cp_internal_allocate_page_with_write_handle(current_vaddr, BASE_VSPACE_CAP + pd, prog_hdr->p_flags);
                     if (dst_write == NULL) {
                         sel4cp_dbg_puts("sel4cp_pd_load_elf: failed to allocate a page required to load the ELF file\n");
                         return -1;
@@ -800,6 +943,11 @@ sel4cp_pd_load_elf(uint8_t *src, sel4cp_pd pd, uint64_t *entry_point)
                 }
             }
         }
+    }
+    
+    if (sel4cp_internal_set_up_ipc_buffer(src, pd)) {
+        sel4cp_dbg_puts("sel4cp_pd_load_elf: failed to set up the IPC buffer\n");
+        return -1;
     }
     
     return sel4cp_internal_set_up_capabilities(src, pd);
@@ -813,7 +961,8 @@ sel4cp_pd_load_elf(uint8_t *src, sel4cp_pd pd, uint64_t *entry_point)
  *  Returns -1 if an error occurs.
  */
 static int 
-sel4cp_pd_run_elf(uint8_t *src, sel4cp_pd pd) {
+sel4cp_pd_run_elf(uint8_t *src, sel4cp_pd pd) 
+{
     uint64_t entry_point;
     int result = sel4cp_pd_load_elf(src, pd, &entry_point);
     if (result)
@@ -823,6 +972,258 @@ sel4cp_pd_run_elf(uint8_t *src, sel4cp_pd pd) {
     
     return 0;
 }
+
+
+/**
+ *  Creates a new PD with the given id.
+ *  No program is loaded for the PD, and the PD is not started.
+ *  Precondition: No PD with the given id already exists in the system.
+ *
+ *  Returns 0 on success.
+ *  Returns -1 if an error occurs.
+ */
+static int
+sel4cp_pd_create(sel4cp_pd pd) 
+{
+    // Allocate a TCB for the new PD.
+    if (alloc_state.tcb_idx >= POOL_NUM_TCBS) {
+        return -1;
+    }
+    uint64_t tcb_cap = BASE_TCB_POOL + alloc_state.tcb_idx;
+    alloc_state.tcb_idx++;
+    
+    // Allocate a notification for the new PD.
+    if (alloc_state.notification_idx >= POOL_NUM_NOTIFICATIONS) {
+        return -1;
+    }
+    uint64_t notification_cap = BASE_NOTIFICATION_POOL + alloc_state.notification_idx;
+    alloc_state.notification_idx++;
+    
+    // Allocate a CNode for the new PD.
+    if (alloc_state.cnode_idx >= POOL_NUM_CNODES) {
+        return -1;
+    }
+    uint64_t cnode_cap = BASE_CNODE_POOL + alloc_state.cnode_idx;
+    alloc_state.cnode_idx++;
+    
+    // Allocate a SchedContext for the new PD.
+    if (alloc_state.schedcontext_idx >= POOL_NUM_SCHEDCONTEXTS) {
+        return -1;
+    }
+    uint64_t schedcontext_cap = BASE_SCHEDCONTEXT_POOL + alloc_state.schedcontext_idx;
+    alloc_state.schedcontext_idx++;
+
+    // Allocate a VSpace for the new PD.
+    if (alloc_state.vspace_idx >= POOL_NUM_VSPACES) {
+        return -1;
+    }
+    uint64_t vspace_cap = BASE_VSPACE_POOL + alloc_state.vspace_idx;
+    alloc_state.vspace_idx++;
+    
+    // Assign the VSpace to the same ASID pool as all other VSpaces in the system.
+    seL4_Error err = seL4_ARM_ASIDPool_Assign(ASID_POOL_CAP_IDX, vspace_cap);
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    
+    // Mint acccess to all fixed capabilities.
+    // 1. SchedControl capability.
+    err = seL4_CNode_Copy(
+        cnode_cap,
+        SCHED_CONTROL_CAP_IDX,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        SCHED_CONTROL_CAP_IDX,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    
+    // 2. Unbadged channel/notification capability.
+    err = seL4_CNode_Copy(
+        cnode_cap,
+        INPUT_CAP_IDX,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        notification_cap,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    err = seL4_CNode_Copy(
+        cnode_cap,
+        BASE_UNBADGED_CHANNEL_CAP + pd,
+        PD_CAP_BITS,
+        cnode_cap,
+        INPUT_CAP_IDX,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    err = seL4_CNode_Copy(
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        BASE_UNBADGED_CHANNEL_CAP + pd,
+        PD_CAP_BITS,
+        cnode_cap,
+        INPUT_CAP_IDX,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    
+    // 3. ASID Pool capability.
+    err = seL4_CNode_Copy(
+        cnode_cap,
+        ASID_POOL_CAP_IDX,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        ASID_POOL_CAP_IDX,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    
+    // 4. TCB capability.
+    err = seL4_CNode_Copy(
+        cnode_cap,
+        BASE_TCB_CAP + pd,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        tcb_cap,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    err = seL4_CNode_Copy(
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        BASE_TCB_CAP + pd,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        tcb_cap,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    
+    // 5. SchedContext capability.
+    err = seL4_CNode_Copy(
+        cnode_cap,
+        BASE_SCHED_CONTEXT_CAP + pd,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        schedcontext_cap,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    err = seL4_CNode_Copy(
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        BASE_SCHED_CONTEXT_CAP + pd,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        schedcontext_cap,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    
+    // 6. CNode capability.
+    err = seL4_CNode_Copy(
+        cnode_cap,
+        BASE_CNODE_CAP + pd,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        cnode_cap,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    err = seL4_CNode_Copy(
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        BASE_CNODE_CAP + pd,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        cnode_cap,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    
+    // 7. VSpace capability.
+    err = seL4_CNode_Copy(
+        cnode_cap,
+        BASE_VSPACE_CAP + pd,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        vspace_cap,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    err = seL4_CNode_Copy(
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        BASE_VSPACE_CAP + pd,
+        PD_CAP_BITS,
+        BASE_CNODE_CAP + sel4cp_current_pd_id,
+        vspace_cap,
+        PD_CAP_BITS,
+        seL4_AllRights
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    
+    
+    // Set the VSpace, CSpace, and fault endpoint.
+    err = seL4_TCB_SetSpace(
+        tcb_cap,
+        FAULT_EP_CAP_IDX,
+        cnode_cap,
+        64 - PD_CAP_BITS,
+        vspace_cap,
+        0
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    
+    // Bind the notification object.
+    err = seL4_TCB_BindNotification(
+        tcb_cap,
+        notification_cap
+    );
+    if (err != seL4_NoError) {
+        return -1;
+    }
+    
+    
+    return 0;
+}
+
 
 // ========== END OF PUBLIC INTERFACE ==========
 

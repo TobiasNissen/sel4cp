@@ -84,6 +84,7 @@ class ProtectionDomain:
     pd_id: Optional[int] # Guaranteed to have a value when part of a SystemDescription.
     name: str
     priority: int
+    mcp: int
     budget: int
     period: int
     pp: bool
@@ -255,14 +256,19 @@ def xml2mr(mr_xml: ET.Element, plat_desc: PlatformDescription) -> SysMemoryRegio
 
 
 def xml2pd(pd_xml: ET.Element, unused_pd_ids: Set[int], is_child: bool=False) -> ProtectionDomain:
-    root_attrs = ("name", "pd_id", "priority", "pp", "budget", "period")
+    root_attrs = ("name", "pd_id", "priority", "mcp", "pp", "budget", "period")
     _check_attrs(pd_xml, root_attrs)
     program_image: Optional[Path] = None
     name = checked_lookup(pd_xml, "name")
     priority = int(pd_xml.attrib.get("priority", "0"), base=0)
     if priority < 0 or priority > 254:
         raise ValueError("priority must be between 0 and 254")
-    
+    mcp = int(pd_xml.attrib.get("mcp", str(priority)), base=0)
+    if mcp < 0 or mcp > 254:
+        raise ValueError("mcp must be between 0 and 254")
+    if mcp < priority:
+        raise ValueError("mcp can not be smaller than the priority")
+        
     pd_id = pd_xml.attrib.get("pd_id", None)
     if pd_id is None:
         if len(unused_pd_ids) == 0:
@@ -332,6 +338,7 @@ def xml2pd(pd_xml: ET.Element, unused_pd_ids: Set[int], is_child: bool=False) ->
         pd_id,
         name,
         priority,
+        mcp,
         budget,
         period,
         pp,

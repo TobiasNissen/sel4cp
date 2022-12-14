@@ -123,8 +123,6 @@ default_platform_description = PlatformDescription(
     page_sizes = (0x1_000, 0x200_000)
 )
 
-EMPTY_PD_IPC_BUFFER_VADDR = 0x203000
-
 @dataclass
 class MonitorConfig:
     untyped_info_symbol_name: str
@@ -1170,19 +1168,18 @@ def build_system(
     ds = []
     pts = []
     for pd_idx, pd in enumerate(system.protection_domains):
-        if pd.program_image is None:
-            ipc_buffer_vaddr = EMPTY_PD_IPC_BUFFER_VADDR
-        else:
-            ipc_buffer_vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
-            
+        vaddrs = []
         upper_directory_vaddrs = set()
         directory_vaddrs = set()
         page_table_vaddrs = set()
+        
+        if pd.program_image is not None:
+            ipc_buffer_vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
+            vaddrs.append((ipc_buffer_vaddr, 0x1000))
 
         # For each page, in each map we determine
         # which upper directory, directory and page table it resides
         # in, and then make sure this is set
-        vaddrs = [(ipc_buffer_vaddr, 0x1000)]
         for map in (pd.maps + pd_extra_maps[pd]):
             mr = all_mr_by_name[map.mr]
             vaddr = map.vaddr
@@ -1353,7 +1350,7 @@ def build_system(
     # For root PDs this shall be the system fault_ep_endpoint_object.
     # For non-root PDs this shall be the parent endpoint.
     badged_fault_ep = system_cap_address_mask | cap_slot
-    for idx, pd in enumerate(system.protection_domains, 1):
+    for idx, (pd, cnode_obj) in enumerate(zip(system.protection_domains, cnode_objects), 1):
         is_root = pd.parent is None
         if is_root:
             fault_ep_cap = fault_ep_endpoint_object.cap_addr
@@ -1376,6 +1373,20 @@ def build_system(
         )
         system_invocations.append(invocation)
         cap_slot += 1
+        
+        # Mint access for each PD to its badged fault endpoint capability.
+        system_invocations.append(
+            Sel4CnodeMint(
+                cnode_obj.cap_addr,
+                FAULT_EP_CAP_IDX,
+                PD_CAP_BITS,
+                root_cnode_cap,
+                fault_ep_cap,
+                kernel_config.cap_address_bits,
+                SEL4_RIGHTS_ALL,
+                badge
+            )
+        )
 
     final_cap_slot = cap_slot
 
@@ -1411,7 +1422,7 @@ def build_system(
             )
         )
     
-    # Setup the BASE_UNBADGED_CHANNEL_CAP and BASE_CNODE_CAP areas.
+    # Setup the BASE_UNBADGED_CHANNEL_CAP, BASE_CNODE_CAP and BASE_VSPACE_CAP areas.
     for pd, cnode_obj, vspace_obj in zip(system.protection_domains, cnode_objects, vspace_objects):
         # Add the PD's own channel capability to the BASE_UNBADGED_CHANNEL_CAP area.
         system_invocations.append(
@@ -1677,19 +1688,17 @@ def build_system(
 
     # And, finally, map all the IPC buffers
     for vspace_obj, pd, ipc_buffer_obj in zip(vspace_objects, system.protection_domains, ipc_buffer_objects):
-        if pd.program_image is None:
-            vaddr = EMPTY_PD_IPC_BUFFER_VADDR
-        else:
+        if pd.program_image is not None:
             vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
-        system_invocations.append(
-            Sel4PageMap(
-                ipc_buffer_obj.cap_addr,
-                vspace_obj.cap_addr,
-                vaddr,
-                rights,
-                attrs
+            system_invocations.append(
+                Sel4PageMap(
+                    ipc_buffer_obj.cap_addr,
+                    vspace_obj.cap_addr,
+                    vaddr,
+                    rights,
+                    attrs
+                )
             )
-        )
 
     # Initialise the TCBs
     #
@@ -1709,7 +1718,7 @@ def build_system(
         )
 
     for tcb_obj, schedcontext_obj, pd in zip(tcb_objects, schedcontext_objects, system.protection_domains):
-        system_invocations.append(Sel4TcbSetSchedParams(tcb_obj.cap_addr, INIT_TCB_CAP_ADDRESS, pd.priority, pd.priority, schedcontext_obj.cap_addr, fault_ep_endpoint_object.cap_addr))
+        system_invocations.append(Sel4TcbSetSchedParams(tcb_obj.cap_addr, INIT_TCB_CAP_ADDRESS, pd.mcp, pd.priority, schedcontext_obj.cap_addr, fault_ep_endpoint_object.cap_addr))
 
     # set vspace / cspace (SetSpace)
     invocation = Sel4TcbSetSpace(tcb_objects[0].cap_addr, badged_fault_ep, cnode_objects[0].cap_addr, kernel_config.cap_address_bits - PD_CAP_BITS, vspace_objects[0].cap_addr, 0)
@@ -1718,11 +1727,9 @@ def build_system(
 
     # set IPC buffer
     for tcb_obj, pd, ipc_buffer_obj in zip(tcb_objects, system.protection_domains, ipc_buffer_objects):
-        if pd.program_image is None:
-            ipc_buffer_vaddr = EMPTY_PD_IPC_BUFFER_VADDR
-        else:
+        if pd.program_image is not None:
             ipc_buffer_vaddr, _ = pd_elf_files[pd].find_symbol("__sel4_ipc_buffer_obj")
-        system_invocations.append(Sel4TcbSetIpcBuffer(tcb_obj.cap_addr, ipc_buffer_vaddr, ipc_buffer_obj.cap_addr,))
+            system_invocations.append(Sel4TcbSetIpcBuffer(tcb_obj.cap_addr, ipc_buffer_vaddr, ipc_buffer_obj.cap_addr,))
 
     # set register (entry point)
     for tcb_obj, pd in zip(tcb_objects, system.protection_domains):
