@@ -87,12 +87,14 @@ SUPPORTED_BOARDS = [
     )
 ]
 
-SUPPORTED_CONFIGS = (
-    ConfigInfo(
+"""
+ConfigInfo(
         name="release",
         debug=False,
         kernel_options = {},
     ),
+"""
+SUPPORTED_CONFIGS = (
     ConfigInfo(
         name="debug",
         debug=True,

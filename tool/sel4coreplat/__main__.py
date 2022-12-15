@@ -699,7 +699,6 @@ def build_system(
         pd: ElfFile.from_path(_get_full_path(pd.program_image, search_paths))
         for pd in system.protection_domains if pd.program_image is not None # There are no ELF files for empty PDs.
     }
-    ### Here we should validate that ELF files
 
     ## Determine physical memory region for 'reserved' memory.
     #
@@ -1766,25 +1765,13 @@ def build_system(
     for pd in system.protection_domains:
         # We can only write the 'sel4cp_name' symbol if the PD is non-empty.
         if pd.program_image is not None:
-            # Could use pd.elf_file.write_symbol here to update variables if required.
             pd_elf_files[pd].write_symbol("sel4cp_name", pack("<16s", pd.name.encode("utf8")))
     
-    # Set the virtual address for the page used for dynamically loading ELF files.
-    # NB: The page is intentionally not allocated to avoid overhead for PDs that
-    # do not need to dynamically load other programs.
-    # Furthermore, set the pd_id for each PD.
+    # Set the pd_id for each PD.
     for pd in system.protection_domains:
         if pd.program_image is None:
             continue # empty PDs do not have an ELF file that can be patched.
         pd_elf_file = pd_elf_files[pd]
-        
-        # The IPC buffer is always at a page after the ELF file, 
-        # so we use the page following this one for the loader page.
-        if pd_elf_file.has_symbol("sel4cp_internal_loader_temp_page_vaddr"):
-            ipc_buffer_vaddr, _ = pd_elf_file.find_symbol("__sel4_ipc_buffer_obj")
-            loader_temp_page_vaddr = ipc_buffer_vaddr + 0x1000 
-            pd_elf_file.write_symbol("sel4cp_internal_loader_temp_page_vaddr", pack("<Q", loader_temp_page_vaddr))
-        
         if pd_elf_file.has_symbol("sel4cp_current_pd_id"):
             pd_elf_file.write_symbol("sel4cp_current_pd_id", pack("<B", pd.pd_id))
 
