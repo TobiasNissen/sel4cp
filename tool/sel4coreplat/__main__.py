@@ -1220,8 +1220,11 @@ def build_system(
     system_invocations.append(invocation)
     
     
-    # Allocate the pools of unused objects for all PDs.
-    for cnode_obj in cnode_objects: 
+    # Allocate the pools of unused objects for all PDs with the protection_domain_control access right.
+    for (pd, cnode_obj) in zip(system.protection_domains, cnode_objects):
+        if not pd.has_protection_domain_control:
+            continue
+    
         init_system.allocate_pool_objects("TCB", SEL4_TCB_OBJECT, POOL_NUM_TCBS, BASE_TCB_POOL, cnode_obj)
         init_system.allocate_pool_objects("Notification", SEL4_NOTIFICATION_OBJECT, POOL_NUM_NOTIFICATIONS, BASE_NOTIFICATION_POOL, cnode_obj)
         init_system.allocate_pool_objects("CNode", SEL4_CNODE_OBJECT, POOL_NUM_CNODES, BASE_CNODE_POOL, cnode_obj, PD_CAP_SIZE)

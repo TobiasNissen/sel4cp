@@ -95,6 +95,7 @@ class ProtectionDomain:
     child_pds: Tuple["ProtectionDomain", ...]
     parent: Optional["ProtectionDomain"]
     has_children: bool
+    has_protection_domain_control: bool
     element: ET.Element
 
     @property
@@ -295,6 +296,7 @@ def xml2pd(pd_xml: ET.Element, unused_pd_ids: Set[int], is_child: bool=False) ->
     irqs = []
     setvars = []
     child_pds = []
+    has_protection_domain_control = False
     for child in pd_xml:
         try:
             if child.tag == "program_image":
@@ -329,6 +331,8 @@ def xml2pd(pd_xml: ET.Element, unused_pd_ids: Set[int], is_child: bool=False) ->
                 setvars.append(SysSetVar(symbol, region_paddr=region_paddr))
             elif child.tag == "protection_domain":
                 child_pds.append(xml2pd(child, unused_pd_ids, is_child=True))
+            elif child.tag == "protection_domain_control":
+                has_protection_domain_control = True
             else:
                 raise UserError(f"Invalid XML element '{child.tag}': {child._loc_str}")  # type: ignore
         except ValueError as e:
@@ -349,6 +353,7 @@ def xml2pd(pd_xml: ET.Element, unused_pd_ids: Set[int], is_child: bool=False) ->
         tuple(child_pds),
         None,
         len(child_pds) > 0,
+        has_protection_domain_control,
         pd_xml
     )
 
